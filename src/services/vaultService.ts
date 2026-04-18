@@ -20,6 +20,7 @@ import {
 } from "@meshsdk/core";
 import type { MeshCardanoBrowserWallet } from "@meshsdk/wallet";
 import { bech32 } from "bech32";
+import { ORACLE_CONTRACT_ADDRESS } from "./charli3OracleService";
 
 // CIP-30 wallets return addresses as raw hex bytes; Blockfrost needs bech32.
 function normalizeAddress(addr: string): string {
@@ -47,6 +48,15 @@ export const SSADA_POLICY_ID =
 
 export const SSADA_TOKEN_NAME =
   import.meta.env.VITE_SSADA_TOKEN_NAME ?? "737341444100";
+
+// Charli3 OracleFeed asset on preprod — policy from contracts/lib/bluesense/oracle.ak:9,
+// token name "OracleFeed" (hex 4f7261636c6546656564). Validator requires a UTxO carrying
+// exactly 1 of this asset in tx.reference_inputs for Rebalance redeemer.
+const ORACLE_FEED_POLICY_ID =
+  "1116903479e7320b8e4592207aaebf627898267fcd80e2d9646cbf07";
+const ORACLE_FEED_TOKEN_NAME_HEX = "4f7261636c6546656564";
+const ORACLE_FEED_ASSET =
+  ORACLE_FEED_POLICY_ID + ORACLE_FEED_TOKEN_NAME_HEX;
 
 // Compiled scripts from plutus.json (vault_spend) and blueprint apply (ssada_mint)
 const VAULT_SCRIPT_CBOR =
@@ -80,24 +90,45 @@ function makeProvider(): BlockfrostProvider | null {
   return new BlockfrostProvider(key);
 }
 
-// Cardano Plutus txs require a collateral input (pure ADA, ≥ ~5 ADA recommended).
-// Eternl only returns one via getCollateral() if the user configured a dedicated
-// collateral UTxO in wallet settings — fall back to any pure-ADA UTxO from the wallet.
+// Cardano Plutus txs require a collateral input (≥ ~5 ADA lovelace).
+// Ledger rule: collateral must be pure-ADA UNLESS the tx sets `totalCollateral` and
+// includes a `collateralReturn` output. Mesh's `setTotalCollateral()` triggers that
+// auto-generation. Returns `{ utxo, multiAsset }` so the caller knows whether to
+// call setTotalCollateral after txInCollateral.
 async function pickCollateral(
   wallet: MeshCardanoBrowserWallet,
   walletUtxos: UTxO[],
-): Promise<UTxO> {
+): Promise<{ utxo: UTxO; multiAsset: boolean }> {
   const explicit = await wallet.getCollateral();
-  if (explicit.length) return explicit[0];
+  // Eternl sometimes returns entries without a fully-hydrated `.output.amount`
+  // (observed: `Cannot read properties of undefined (reading 'amount')`). Guard
+  // the access; if shape is unexpected, fall through to walletUtxos-based pick.
+  const first = explicit[0];
+  if (first?.output?.amount) {
+    return { utxo: first, multiAsset: first.output.amount.length > 1 };
+  }
   const MIN_COLLATERAL = 5_000_000n;
-  const fallback = walletUtxos.find((u) => {
-    if (u.output.amount.length !== 1) return false;
-    const only = u.output.amount[0];
-    return only.unit === "lovelace" && BigInt(only.quantity) >= MIN_COLLATERAL;
-  });
-  if (!fallback) throw new Error("No pure-ADA UTxO ≥5 ADA available for collateral. Send yourself a 5+ ADA UTxO or configure collateral in Eternl settings.");
-  return fallback;
+  const lovelaceOf = (u: UTxO) => {
+    const lov = u.output.amount.find((a) => a.unit === "lovelace");
+    return lov ? BigInt(lov.quantity) : 0n;
+  };
+  // Prefer pure-ADA UTxOs (no collateralReturn output needed, cheaper tx).
+  const pureAda = walletUtxos.find(
+    (u) => u.output.amount.length === 1 && lovelaceOf(u) >= MIN_COLLATERAL,
+  );
+  if (pureAda) return { utxo: pureAda, multiAsset: false };
+  // Fall back: multi-asset UTxO with enough lovelace; Mesh will generate collateralReturn.
+  const mixed = walletUtxos.find((u) => lovelaceOf(u) >= MIN_COLLATERAL);
+  if (!mixed) {
+    throw new Error(
+      "No UTxO with ≥5 ADA lovelace available for collateral. Fund your wallet with 5+ ADA or configure collateral in Eternl settings.",
+    );
+  }
+  return { utxo: mixed, multiAsset: true };
 }
+
+// Standard Plutus collateral amount (5 ADA). Used when setTotalCollateral is required.
+const COLLATERAL_AMOUNT_LOVELACE = "5000000";
 
 // ── Datum encoding ────────────────────────────────────────────────────────────
 
@@ -198,6 +229,24 @@ export async function fetchVaultUtxo(): Promise<UTxO | null> {
   }
 }
 
+// Locates the live Charli3 OracleFeed UTxO — the specific one holding the OracleFeed
+// token. validator's oracle.find_oracle_input filters reference_inputs by this exact asset.
+async function fetchOracleFeedUtxo(provider: BlockfrostProvider): Promise<UTxO> {
+  const utxos = await provider.fetchAddressUTxOs(ORACLE_CONTRACT_ADDRESS);
+  const found = utxos.find((u) =>
+    u.output.amount.some(
+      (a) => a.unit === ORACLE_FEED_ASSET && BigInt(a.quantity) >= 1n,
+    ),
+  );
+  if (!found) {
+    throw new Error(
+      `Charli3 OracleFeed UTxO not found at ${ORACLE_CONTRACT_ADDRESS}. ` +
+        `Oracle feed may be offline — Rebalance requires a fresh on-chain price.`,
+    );
+  }
+  return found;
+}
+
 // ── ssADA amount math ─────────────────────────────────────────────────────────
 
 function calcMintAmount(
@@ -277,7 +326,7 @@ export async function buildDepositTx(
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address — fund your preprod wallet first.");
-  const collateral = await pickCollateral(wallet, userUtxos);
+  const { utxo: collateral, multiAsset: collateralMultiAsset } = await pickCollateral(wallet, userUtxos);
   const depositLovelace = BigInt(Math.floor(depositAda * 1_000_000));
 
   const vaultUtxo = await fetchVaultUtxo();
@@ -350,6 +399,10 @@ export async function buildDepositTx(
     .changeAddress(userAddress)
     .selectUtxosFrom(userUtxos);
 
+  if (collateralMultiAsset) {
+    txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
+  }
+
   const unsignedTx = await txBuilder.complete();
   const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
 
@@ -376,14 +429,31 @@ export async function buildWithdrawTx(
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
-  const collateral = await pickCollateral(wallet, userUtxos);
+  const { utxo: collateral, multiAsset: collateralMultiAsset } = await pickCollateral(wallet, userUtxos);
 
   const vaultUtxo = await fetchVaultUtxo();
   if (!vaultUtxo) throw new Error("No vault UTxO found");
   const vaultState = parseVaultState(vaultUtxo);
   if (!vaultState) throw new Error("Cannot parse vault datum");
 
-  const adaToReturn  = calcRedeemAmount(ssadaBurnAmount, vaultState.totalAdaLovelace, vaultState.totalSsada);
+  // Vault output must retain ≥MIN_VAULT_LOVELACE (Cardano minUtxo for script addr +
+  // inline datum ≈1.2 ADA; 2 ADA gives headroom). If the requested burn would drain
+  // the vault, cap the burn so the vault keeps MIN_VAULT_LOVELACE. User eats a
+  // small ssADA dust position — acceptable for demo; solves minUtxo violation.
+  const MIN_VAULT_LOVELACE = 2_000_000n;
+  const maxReturn = vaultState.totalAdaLovelace - MIN_VAULT_LOVELACE;
+  const uncappedReturn = calcRedeemAmount(ssadaBurnAmount, vaultState.totalAdaLovelace, vaultState.totalSsada);
+  let adaToReturn: bigint;
+  if (uncappedReturn <= maxReturn) {
+    adaToReturn = uncappedReturn;
+  } else {
+    // Cap burn so vault retains MIN_VAULT_LOVELACE. Recompute adaToReturn from the
+    // capped burn (not from maxReturn directly) so integer-division round-trips and
+    // the on-chain `expected_ada_out` check matches our output exactly.
+    ssadaBurnAmount = (maxReturn * vaultState.totalSsada) / vaultState.totalAdaLovelace;
+    adaToReturn = calcRedeemAmount(ssadaBurnAmount, vaultState.totalAdaLovelace, vaultState.totalSsada);
+  }
+
   const newTotalAda  = vaultState.totalAdaLovelace - adaToReturn;
   const newTotalSsada = vaultState.totalSsada - ssadaBurnAmount;
   const newDatum = buildVaultDatumData(newTotalAda, newTotalSsada, vaultState.strategy, Date.now());
@@ -435,6 +505,10 @@ export async function buildWithdrawTx(
     .changeAddress(userAddress)
     .selectUtxosFrom(userUtxos);
 
+  if (collateralMultiAsset) {
+    txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
+  }
+
   const unsignedTx = await txBuilder.complete();
   const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
 
@@ -444,6 +518,121 @@ export async function buildWithdrawTx(
   } catch (err) {
     console.error("[buildWithdrawTx] submitTx raw error:", err);
     const msg = (err as { info?: string })?.info ?? (err as { message?: string })?.message ?? JSON.stringify(err);
+    throw new Error(`Submit failed: ${msg}`);
+  }
+}
+
+// ── Rebalance ─────────────────────────────────────────────────────────────────
+//
+// Invariants enforced by vault_spend.ak:
+//   - ADA total UNCHANGED
+//   - ssADA total UNCHANGED
+//   - ssada_policy_id UNCHANGED
+//   - last_rebalance_ms MUST strictly increase
+//   - Charli3 OracleFeed UTxO MUST be in tx.reference_inputs (via find_oracle_input)
+//   - Oracle expiry_ms > tx.validity_range.upper_bound (freshness check)
+
+export async function buildRebalanceTx(
+  wallet: MeshCardanoBrowserWallet,
+  newStrategy: Strategy,
+): Promise<{ txHash: string; newStrategy: Strategy }> {
+  const provider = makeProvider();
+  if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
+
+  const userAddress = await wallet.getChangeAddressBech32();
+  if (!userAddress) throw new Error("Wallet not connected or no address found");
+  const userUtxos = await provider.fetchAddressUTxOs(userAddress);
+  if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
+  const { utxo: collateral, multiAsset: collateralMultiAsset } = await pickCollateral(wallet, userUtxos);
+
+  const vaultUtxo = await fetchVaultUtxo();
+  if (!vaultUtxo) throw new Error("No vault UTxO found");
+  const vaultState = parseVaultState(vaultUtxo);
+  if (!vaultState) throw new Error("Cannot parse vault datum");
+
+  if (vaultState.strategy === newStrategy) {
+    throw new Error(`Vault is already on ${newStrategy} — no rebalance needed`);
+  }
+
+  // MANDATORY: Charli3 oracle as reference input
+  const oracleUtxo = await fetchOracleFeedUtxo(provider);
+
+  // Oracle freshness requires tx TTL to precede oracle expiry. Charli3 preprod feeds
+  // typically live 10–20 min; set TTL ~5 min ahead (300 slots on preprod, 1 slot = 1s).
+  const latestBlock = await provider.fetchLatestBlock();
+  const ttlSlot = parseInt(latestBlock.slot, 10) + 300;
+
+  // last_rebalance_ms must strictly increase
+  const nowMs = Date.now();
+  const newLastRebalanceMs = Math.max(nowMs, vaultState.lastRebalanceMs + 1);
+
+  // Invariants: ADA + ssADA + policy_id unchanged; only strategy + timestamp move
+  const newDatum = buildVaultDatumData(
+    vaultState.totalAdaLovelace,
+    vaultState.totalSsada,
+    newStrategy,
+    newLastRebalanceMs,
+  );
+
+  const vaultRedeemer: Data = conStr2([]); // Rebalance
+
+  const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
+  txBuilder.setNetwork("preprod");
+
+  txBuilder
+    .spendingPlutusScriptV3()
+    .txIn(
+      vaultUtxo.input.txHash,
+      vaultUtxo.input.outputIndex,
+      vaultUtxo.output.amount,
+      vaultUtxo.output.address,
+    )
+    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInInlineDatumPresent()
+    .txInRedeemerValue(vaultRedeemer, "JSON");
+
+  // Vault output — lovelace EXACTLY unchanged (validator checks equality)
+  const vaultLovelace =
+    vaultUtxo.output.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0";
+  txBuilder
+    .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: vaultLovelace }])
+    .txOutInlineDatumValue(newDatum, "JSON");
+
+  // Reference inputs — oracle UTxO carries the OracleFeed asset the validator filters for
+  txBuilder.readOnlyTxInReference(
+    oracleUtxo.input.txHash,
+    oracleUtxo.input.outputIndex,
+  );
+
+  // Freshness window
+  txBuilder.invalidHereafter(ttlSlot);
+
+  txBuilder
+    .txInCollateral(
+      collateral.input.txHash,
+      collateral.input.outputIndex,
+      collateral.output.amount,
+      collateral.output.address,
+    )
+    .changeAddress(userAddress)
+    .selectUtxosFrom(userUtxos);
+
+  if (collateralMultiAsset) {
+    txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
+  }
+
+  const unsignedTx = await txBuilder.complete();
+  const signedTx = await wallet.signTxReturnFullTx(unsignedTx, true);
+
+  try {
+    const txHash = await provider.submitTx(signedTx);
+    return { txHash, newStrategy };
+  } catch (err) {
+    console.error("[buildRebalanceTx] submitTx raw error:", err);
+    const msg =
+      (err as { info?: string })?.info ??
+      (err as { message?: string })?.message ??
+      JSON.stringify(err);
     throw new Error(`Submit failed: ${msg}`);
   }
 }

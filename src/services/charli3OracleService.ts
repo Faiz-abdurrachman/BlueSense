@@ -54,6 +54,7 @@ interface CacheEntry {
 }
 
 let cache: CacheEntry | null = null;
+let inFlight: Promise<OraclePrices> | null = null;
 
 const BASE_URL =
   import.meta.env.VITE_CHARLI3_BASE_URL ?? "https://api.charli3.io/api/v1";
@@ -103,35 +104,51 @@ export async function fetchMINPrice(adaUsd?: number): Promise<number> {
 export async function fetchAllPrices(): Promise<OraclePrices> {
   const now = Date.now();
   if (cache && cache.expiresAt > now) return cache.data;
+  // Coalesce concurrent callers so a cold-start render burst (Dashboard +
+  // Vaults + StrictMode double-mount) only fires one upstream request.
+  if (inFlight) return inFlight;
 
-  let adaPrice = MOCK_ADA_PRICE;
-  let minPrice = MOCK_MIN_PRICE;
-  let isLive   = false;
+  inFlight = (async () => {
+    let adaPrice = MOCK_ADA_PRICE;
+    let minPrice = MOCK_MIN_PRICE;
+    let isLive   = false;
 
-  if (hasRealKey()) {
-    try {
-      // Fetch both pools in parallel
-      const [usdmData, minData] = await Promise.all([
-        fetchPool(USDM_POOL_TICKER),
-        fetchPool(MIN_POOL_TICKER),
-      ]);
+    if (hasRealKey()) {
+      try {
+        const [usdmData, minData] = await Promise.all([
+          fetchPool(USDM_POOL_TICKER),
+          fetchPool(MIN_POOL_TICKER),
+        ]);
 
-      const usdmPerAda = usdmData.current_price;
-      const minPerAda  = minData.current_price;
+        const usdmPerAda = usdmData.current_price;
+        const minPerAda  = minData.current_price;
 
-      if (usdmPerAda && usdmPerAda > 0) {
-        adaPrice = 1 / usdmPerAda;
-        isLive   = true;
+        if (usdmPerAda && usdmPerAda > 0) {
+          adaPrice = 1 / usdmPerAda;
+          isLive   = true;
+        }
+        if (minPerAda && minPerAda > 0 && isLive) {
+          minPrice = minPerAda * adaPrice;
+        }
+      } catch {
+        // On upstream failure (incl. 429), serve the most recent cached data
+        // past its TTL rather than falling to mocks — keeps the UI stable.
+        if (cache) {
+          inFlight = null;
+          return cache.data;
+        }
+        isLive = false;
       }
-      if (minPerAda && minPerAda > 0 && isLive) {
-        minPrice = minPerAda * adaPrice;
-      }
-    } catch {
-      isLive = false;
     }
-  }
 
-  const result: OraclePrices = { adaPrice, minPrice, isLive, fetchedAt: new Date() };
-  cache = { data: result, expiresAt: now + CACHE_TTL_MS };
-  return result;
+    const result: OraclePrices = { adaPrice, minPrice, isLive, fetchedAt: new Date() };
+    cache = { data: result, expiresAt: Date.now() + CACHE_TTL_MS };
+    return result;
+  })();
+
+  try {
+    return await inFlight;
+  } finally {
+    inFlight = null;
+  }
 }

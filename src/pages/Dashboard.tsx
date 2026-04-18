@@ -2,13 +2,19 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { CaretDown, Moon, MagnifyingGlass, CheckCircle, Copy, Faders, ArrowsLeftRight } from "@phosphor-icons/react";
-import { useWallet, useLovelace } from "@meshsdk/react";
+import { useWallet, useLovelace, useAssets } from "@meshsdk/react";
 import { WalletConnect } from "../components/WalletConnect";
 import { useStrategyRecommendation } from "../hooks/useStrategyRecommendation";
 import { ORACLE_CONTRACT_ADDRESS } from "../services/charli3OracleService";
-import { forceRebalanceTo, type Strategy } from "../services/strategyRouter";
+import { forceRebalanceTo, type Strategy, type StrategyId } from "../services/strategyRouter";
 import { RebalanceAnimation } from "../components/RebalanceAnimation";
-import { buildDepositTx, buildWithdrawTx } from "../services/vaultService";
+import { buildDepositTx, buildWithdrawTx, buildRebalanceTx, fetchVaultUtxo, parseVaultState, SSADA_POLICY_ID, type Strategy as VaultStrategy } from "../services/vaultService";
+
+const STRATEGY_ID_TO_VAULT: Record<StrategyId, VaultStrategy> = {
+  staking: "NativeStaking",
+  liqwid: "LiqwidLending",
+  minswap: "MinswapLP",
+};
 
 function lovelaceToAda(lovelace: string | undefined): number {
   if (!lovelace) return 0;
@@ -21,10 +27,21 @@ export function Dashboard() {
 
   const { connected, wallet } = useWallet();
   const lovelace = useLovelace();
+  const assets = useAssets();
   const walletAda = lovelaceToAda(lovelace);
+
+  // Hydrate ssADA position from wallet every render — single source of truth.
+  // Previous local-state counter didn't survive page reloads or cross-session deposits.
+  const ssAdaAsset = assets?.find((a) => a.unit.startsWith(SSADA_POLICY_ID));
+  const walletSsAdaTokens = ssAdaAsset ? BigInt(ssAdaAsset.quantity) : 0n;
+  const walletSsAdaBalance = Number(walletSsAdaTokens) / 1_000_000;
 
   const [ssAdaBalance, setSsAdaBalance] = useState(0);
   const [ssAdaTokens, setSsAdaTokens] = useState(0n);
+  useEffect(() => {
+    setSsAdaBalance(walletSsAdaBalance);
+    setSsAdaTokens(walletSsAdaTokens);
+  }, [walletSsAdaBalance, walletSsAdaTokens]);
   const [depositAmount, setDepositAmount] = useState("");
   const [rebalanceNotice, setRebalanceNotice] = useState<string | null>(null);
   const [demoRebalance, setDemoRebalance] = useState<{ from: Strategy; to: Strategy } | null>(null);
@@ -34,12 +51,61 @@ export function Dashboard() {
 
   const recommendation = useStrategyRecommendation();
 
-  const handleForceRebalance = () => {
+  const [rebalancing, setRebalancing] = useState(false);
+  const [rebalanceTxHash, setRebalanceTxHash] = useState<string | null>(null);
+
+  // Live vault TVL — totalAdaLovelace from on-chain × ADA/USD from Charli3 oracle.
+  // Refresh every 30s and whenever a tx hash changes (post-deposit/withdraw/rebalance).
+  const [vaultLovelace, setVaultLovelace] = useState<bigint>(0n);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      const utxo = await fetchVaultUtxo();
+      if (!utxo || cancelled) return;
+      const state = parseVaultState(utxo);
+      if (state && !cancelled) setVaultLovelace(state.totalAdaLovelace);
+    };
+    load();
+    const interval = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [txHash, rebalanceTxHash]);
+
+  const vaultAdaTotal = Number(vaultLovelace) / 1_000_000;
+  const vaultTvlUsd = vaultAdaTotal * recommendation.adaPrice;
+  const formatTvl = (usd: number): string => {
+    if (usd === 0) return "$0.00";
+    if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
+    if (usd >= 1_000) return `$${(usd / 1_000).toFixed(2)}K`;
+    return `$${usd.toFixed(2)}`;
+  };
+
+  const handleForceRebalance = async () => {
     const current = recommendation.allStrategies.find((s) => s.id === recommendation.activeStrategy);
     const best = recommendation.allStrategies
       .filter((s) => s.id !== recommendation.activeStrategy)
       .reduce((a, b) => (a.apy > b.apy ? a : b));
     if (!current) return;
+
+    // If a wallet is connected, submit a real on-chain Rebalance tx.
+    // Validator attaches Charli3 oracle as reference_input — closes PRD §12 #2.
+    if (connected && wallet) {
+      setRebalancing(true);
+      setRebalanceTxHash(null);
+      setTxError(null);
+      try {
+        const result = await buildRebalanceTx(wallet, STRATEGY_ID_TO_VAULT[best.id]);
+        setRebalanceTxHash(result.txHash);
+        forceRebalanceTo(best.id);
+        setDemoRebalance({ from: current, to: best });
+      } catch (err) {
+        setTxError(err instanceof Error ? err.message : "Rebalance failed");
+      } finally {
+        setRebalancing(false);
+      }
+      return;
+    }
+
+    // Wallet not connected → UI-only demo fallback
     forceRebalanceTo(best.id);
     setDemoRebalance({ from: current, to: best });
   };
@@ -60,28 +126,31 @@ export function Dashboard() {
   const minswapAPY  = recommendation.allStrategies.find((s) => s.id === "minswap")?.apy  ?? 0.28;
   const bestAPY     = recommendation.allStrategies.find((s) => s.id === recommendation.currentBest)?.apy ?? 0.125;
 
+  // Real allocation: 10% to reserve, 90% to active strategy.
+  const reserveTvl = vaultTvlUsd * 0.1;
+  const activeTvl  = vaultTvlUsd * 0.9;
   const strategies = [
-    { name: "BlueSense Target Reserve", apy: "0%", color: "#93c5fd", percentage: "10%", tvl: "$425,000" },
+    { name: "BlueSense Target Reserve", apy: "0%", color: "#93c5fd", percentage: "10%", tvl: formatTvl(reserveTvl) },
     {
       name: `Liqwid ADA Lending${recommendation.activeStrategy === "liqwid" ? " (Active)" : ""}`,
       apy: `${(liqwidAPY * 100).toFixed(1)}%`,
       color: recommendation.activeStrategy === "liqwid" ? "#0033AD" : "#dbeafe",
       percentage: recommendation.activeStrategy === "liqwid" ? "90%" : "0%",
-      tvl: recommendation.activeStrategy === "liqwid" ? "$3,825,000" : "$0.00",
+      tvl: recommendation.activeStrategy === "liqwid" ? formatTvl(activeTvl) : "$0.00",
     },
     {
       name: `Cardano Native Staking${recommendation.activeStrategy === "staking" ? " (Active)" : ""}`,
       apy: `${(stakingAPY * 100).toFixed(1)}%`,
       color: recommendation.activeStrategy === "staking" ? "#0033AD" : "#dbeafe",
-      percentage: "0%",
-      tvl: "$0.00",
+      percentage: recommendation.activeStrategy === "staking" ? "90%" : "0%",
+      tvl: recommendation.activeStrategy === "staking" ? formatTvl(activeTvl) : "$0.00",
     },
     {
       name: `Minswap ADA/MIN LP${recommendation.activeStrategy === "minswap" ? " (Active)" : ""}`,
       apy: `${(minswapAPY * 100).toFixed(1)}%`,
       color: recommendation.activeStrategy === "minswap" ? "#0033AD" : "#dbeafe",
-      percentage: "0%",
-      tvl: "$0.00",
+      percentage: recommendation.activeStrategy === "minswap" ? "90%" : "0%",
+      tvl: recommendation.activeStrategy === "minswap" ? formatTvl(activeTvl) : "$0.00",
     },
   ];
 
@@ -92,7 +161,7 @@ export function Dashboard() {
       labels: ["Cardano", "Auto-Compound", "Single Asset"],
       fees: "0% | 0%",
       apy: `${(bestAPY * 100).toFixed(1)}%`,
-      tvl: "$4.25M",
+      tvl: formatTvl(vaultTvlUsd),
       hasCheck: true
     },
     {
@@ -235,9 +304,22 @@ export function Dashboard() {
             )}
             <button
               onClick={handleForceRebalance}
-              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#0033AD] hover:bg-blue-700 text-white text-[12px] font-bold rounded-lg transition-colors shadow-sm flex-shrink-0"
+              disabled={rebalancing}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#0033AD] hover:bg-blue-700 text-white text-[12px] font-bold rounded-lg transition-colors shadow-sm flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              <span>⚡</span> Force Rebalance
+              {rebalancing ? (
+                <>
+                  <svg className="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  Rebalancing…
+                </>
+              ) : (
+                <>
+                  <span>⚡</span> Force Rebalance
+                </>
+              )}
             </button>
           </div>
         </div>
@@ -256,6 +338,40 @@ export function Dashboard() {
                 <p className="text-[13px] font-bold text-emerald-800">Oracle Triggered Rebalancing</p>
                 <p className="text-[12px] text-emerald-700 mt-0.5">{rebalanceNotice}</p>
               </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Rebalance On-Chain Tx Banner */}
+        <AnimatePresence>
+          {rebalanceTxHash && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-xl px-5 py-3.5 mb-5 shadow-sm"
+            >
+              <span className="text-[#0033AD] mt-0.5 flex-shrink-0">⛓</span>
+              <div className="flex-1">
+                <p className="text-[13px] font-bold text-blue-900">Rebalance Tx Submitted On-Chain</p>
+                <p className="text-[12px] text-blue-700 mt-0.5">
+                  Charli3 oracle attached as <span className="font-mono">reference_input</span> — verified on-chain per PRD §12 #2
+                </p>
+                <a
+                  href={`https://preprod.cardanoscan.io/transaction/${rebalanceTxHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[12px] font-mono text-[#0033AD] hover:underline break-all"
+                >
+                  {rebalanceTxHash.slice(0, 24)}…{rebalanceTxHash.slice(-10)}
+                </a>
+              </div>
+              <button
+                onClick={() => setRebalanceTxHash(null)}
+                className="text-blue-400 hover:text-blue-600 text-lg flex-shrink-0"
+              >
+                ×
+              </button>
             </motion.div>
           )}
         </AnimatePresence>

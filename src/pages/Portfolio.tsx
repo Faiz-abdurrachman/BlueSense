@@ -2,6 +2,7 @@ import { Link } from "react-router-dom";
 import { CaretDown, Moon, CheckCircle } from "@phosphor-icons/react";
 import { useWallet, useLovelace, useAssets } from "@meshsdk/react";
 import { WalletConnect } from "../components/WalletConnect";
+import { SSADA_POLICY_ID } from "../services/vaultService";
 
 function lovelaceToAda(lovelace: string | undefined): string {
   if (!lovelace) return "0.00";
@@ -21,7 +22,8 @@ export function Portfolio() {
   const lovelace = useLovelace();
   const assets = useAssets();
 
-  const ssAdaAssets = assets?.filter(a => a.unit.includes("ssADA") || a.assetName?.toLowerCase().includes("ssada")) ?? [];
+  // Assets `.unit` is hex (policyId+tokenName) — match by our known policy ID.
+  const ssAdaAssets = assets?.filter((a) => a.unit.startsWith(SSADA_POLICY_ID)) ?? [];
 
   const recommendations = [
     {
@@ -134,7 +136,7 @@ export function Portfolio() {
                    {ssAdaAssets.length > 0 && (
                      <div>
                        <p className="text-[11px] text-gray-400 font-semibold uppercase tracking-wider mb-1">ssADA Held</p>
-                       <p className="text-[20px] font-bold text-[#0033AD]">{ssAdaAssets[0].quantity}</p>
+                       <p className="text-[20px] font-bold text-[#0033AD]">{lovelaceToAda(ssAdaAssets[0].quantity)} ssADA</p>
                      </div>
                    )}
                  </div>
@@ -152,7 +154,7 @@ export function Portfolio() {
                            <p className="text-[12px] text-gray-400 font-mono">{asset.unit.slice(0, 20)}...</p>
                          </div>
                        </div>
-                       <p className="font-bold text-[16px] text-[#0033AD]">{asset.quantity}</p>
+                       <p className="font-bold text-[16px] text-[#0033AD]">{lovelaceToAda(asset.quantity)} ssADA</p>
                      </div>
                    ))}
                  </div>
