@@ -8,6 +8,7 @@
 import {
   BlockfrostProvider,
   MeshTxBuilder,
+  applyCborEncoding,
   conStr0,
   conStr1,
   conStr2,
@@ -18,6 +19,17 @@ import {
   type Data,
 } from "@meshsdk/core";
 import type { MeshCardanoBrowserWallet } from "@meshsdk/wallet";
+import { bech32 } from "bech32";
+
+// CIP-30 wallets return addresses as raw hex bytes; Blockfrost needs bech32.
+function normalizeAddress(addr: string): string {
+  if (addr.startsWith("addr")) return addr;
+  const bytes = Buffer.from(addr, "hex");
+  const words = bech32.toWords(bytes);
+  // header byte 0x00–0x0f = testnet, 0x10–0x1f = mainnet
+  const isMainnet = (bytes[0] & 0x0f) === 1;
+  return bech32.encode(isMainnet ? "addr" : "addr_test", words, 1000);
+}
 
 // ── Contract constants ────────────────────────────────────────────────────────
 
@@ -68,6 +80,25 @@ function makeProvider(): BlockfrostProvider | null {
   return new BlockfrostProvider(key);
 }
 
+// Cardano Plutus txs require a collateral input (pure ADA, ≥ ~5 ADA recommended).
+// Eternl only returns one via getCollateral() if the user configured a dedicated
+// collateral UTxO in wallet settings — fall back to any pure-ADA UTxO from the wallet.
+async function pickCollateral(
+  wallet: MeshCardanoBrowserWallet,
+  walletUtxos: UTxO[],
+): Promise<UTxO> {
+  const explicit = await wallet.getCollateral();
+  if (explicit.length) return explicit[0];
+  const MIN_COLLATERAL = 5_000_000n;
+  const fallback = walletUtxos.find((u) => {
+    if (u.output.amount.length !== 1) return false;
+    const only = u.output.amount[0];
+    return only.unit === "lovelace" && BigInt(only.quantity) >= MIN_COLLATERAL;
+  });
+  if (!fallback) throw new Error("No pure-ADA UTxO ≥5 ADA available for collateral. Send yourself a 5+ ADA UTxO or configure collateral in Eternl settings.");
+  return fallback;
+}
+
 // ── Datum encoding ────────────────────────────────────────────────────────────
 
 function strategyData(s: Strategy): Data {
@@ -84,6 +115,8 @@ export function buildVaultDatumData(
   strategy: Strategy,
   lastRebalanceMs: number,
 ): Data {
+  // conStr0 produces { constructor, fields } — compatible with "JSON" format only.
+  // "Mesh" format reads .alternative (wrong key) → always use "JSON" for serialization.
   return conStr0([
     integer(Number(totalAdaLovelace)),
     integer(Number(totalSsada)),
@@ -101,23 +134,55 @@ function strategyFromIndex(idx: number): Strategy {
   return "NativeStaking";
 }
 
-export function parseVaultState(utxo: UTxO): VaultState | null {
+// Minimal CBOR uint reader for info bytes 0..27 (unsigned 0..2^64-1).
+function readCborUint(bytes: Uint8Array, offset: number): [bigint, number] {
+  const header = bytes[offset];
+  if ((header & 0xe0) !== 0x00) throw new Error("not a CBOR uint");
+  const info = header & 0x1f;
+  if (info < 24) return [BigInt(info), offset + 1];
+  const widths: Record<number, number> = { 24: 1, 25: 2, 26: 4, 27: 8 };
+  const w = widths[info];
+  if (!w) throw new Error(`unsupported uint info ${info}`);
+  let v = 0n;
+  for (let i = 1; i <= w; i++) v = (v << 8n) | BigInt(bytes[offset + i]);
+  return [v, offset + 1 + w];
+}
+
+// Decode the on-chain VaultDatum: Constr(0, [Int, Int, Constr(n, []), Int, ByteString]).
+// Matches encoding produced by buildVaultDatumData().
+function decodeVaultDatum(hexCbor: string):
+  | { totalAdaLovelace: bigint; totalSsada: bigint; strategy: Strategy; lastRebalanceMs: number }
+  | null {
   try {
-    const raw = utxo.output.plutusData;
-    if (!raw) return null;
-    // Minimal CBOR decode: d87982 = Constr(0, [5 fields])
-    // For demo, if datum is not yet on-chain, return empty vault
-    const state: VaultState = {
-      totalAdaLovelace: 0n,
-      totalSsada: 0n,
-      strategy: "NativeStaking",
-      lastRebalanceMs: Date.now(),
-      utxo,
+    const bytes = Uint8Array.from(Buffer.from(hexCbor, "hex"));
+    let i = 0;
+    if (bytes[i++] !== 0xd8 || bytes[i++] !== 0x79) return null; // tag 121 = Constr(0)
+    const arr = bytes[i++];
+    if (arr !== 0x9f && (arr & 0xe0) !== 0x80) return null; // indefinite or definite array
+    const [totalAdaLovelace, i1] = readCborUint(bytes, i); i = i1;
+    const [totalSsada, i2] = readCborUint(bytes, i); i = i2;
+    if (bytes[i++] !== 0xd8) return null;
+    const strategyTag = bytes[i++]; // 0x79 Constr(0), 0x7a Constr(1), 0x7b Constr(2)
+    if (bytes[i++] !== 0x80) return null;
+    const strategy = strategyFromIndex(strategyTag - 0x79);
+    const [lastRebalance] = readCborUint(bytes, i);
+    return {
+      totalAdaLovelace,
+      totalSsada,
+      strategy,
+      lastRebalanceMs: Number(lastRebalance),
     };
-    return state;
   } catch {
     return null;
   }
+}
+
+export function parseVaultState(utxo: UTxO): VaultState | null {
+  const raw = utxo.output.plutusData;
+  if (!raw) return null;
+  const decoded = decodeVaultDatum(raw);
+  if (!decoded) return null;
+  return { ...decoded, utxo };
 }
 
 // ── Vault UTxO fetching ───────────────────────────────────────────────────────
@@ -152,6 +217,53 @@ function calcRedeemAmount(
   return (ssadaBurn * totalAda) / totalSsada;
 }
 
+// ── Vault Initialization ──────────────────────────────────────────────────────
+
+export async function initializeVault(wallet: MeshCardanoBrowserWallet): Promise<string> {
+  const provider = makeProvider();
+  if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
+
+  // getChangeAddressBech32 returns bech32 directly (no normalizeAddress needed)
+  const userAddress = await wallet.getChangeAddressBech32();
+  if (!userAddress) throw new Error("Wallet not connected or no address found");
+
+  const walletUtxos = await provider.fetchAddressUTxOs(userAddress);
+  if (!walletUtxos.length) throw new Error("No UTxOs at wallet address — fund your preprod wallet first.");
+
+  const initLovelace = 2_000_000n;
+  const initDatum = buildVaultDatumData(initLovelace, 0n, "NativeStaking", Date.now());
+
+  // Simple payment — no scripts, no minting, no redeemers.
+  // Do NOT call setNetwork() here: it can cause the SDK to write a script_data_hash
+  // into the tx body even when there are no redeemers, which makes Blockfrost reject
+  // with "missingRequiredScripts spend:0 mint:0".
+  const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider });
+
+  const unsignedTx = await txBuilder
+    .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: initLovelace.toString() }])
+    .txOutInlineDatumValue(initDatum, "JSON")
+    .changeAddress(userAddress)
+    .selectUtxosFrom(walletUtxos)
+    .complete();
+
+  // signTxReturnFullTx returns the FULL signed tx CBOR (not just witness set)
+  const signedTx = await wallet.signTxReturnFullTx(unsignedTx, false);
+
+  // Submit via Blockfrost for accurate error messages (wallet throws opaque CIP-30 objects)
+  try {
+    const txHash = await provider.submitTx(signedTx);
+    return txHash;
+  } catch (err) {
+    console.error("[initializeVault] submitTx raw error:", err);
+    // Extract message from Blockfrost error or CIP-30 TxSendError
+    const msg =
+      (err as { info?: string })?.info ??
+      (err as { message?: string })?.message ??
+      JSON.stringify(err);
+    throw new Error(`Submit failed: ${msg}`);
+  }
+}
+
 // ── Deposit ───────────────────────────────────────────────────────────────────
 
 export async function buildDepositTx(
@@ -161,55 +273,57 @@ export async function buildDepositTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const [userAddress] = await wallet.getUsedAddresses();
-  const userUtxos = await wallet.getUtxos();
+  const userAddress = await wallet.getChangeAddressBech32();
+  if (!userAddress) throw new Error("Wallet not connected or no address found");
+  const userUtxos = await provider.fetchAddressUTxOs(userAddress);
+  if (!userUtxos.length) throw new Error("No UTxOs at wallet address — fund your preprod wallet first.");
+  const collateral = await pickCollateral(wallet, userUtxos);
   const depositLovelace = BigInt(Math.floor(depositAda * 1_000_000));
 
-  // Fetch current vault state
   const vaultUtxo = await fetchVaultUtxo();
-  const vaultState = vaultUtxo ? parseVaultState(vaultUtxo) : null;
+  if (!vaultUtxo) throw new Error("Vault not initialized. Use the Initialize Vault button first.");
 
-  const prevTotalAda    = vaultState?.totalAdaLovelace ?? 0n;
-  const prevTotalSsada  = vaultState?.totalSsada       ?? 0n;
+  const vaultState = parseVaultState(vaultUtxo);
+  if (!vaultState) throw new Error("Cannot decode vault datum — on-chain state unreadable.");
+
+  const prevTotalAda    = vaultState.totalAdaLovelace;
+  const prevTotalSsada  = vaultState.totalSsada;
   const newTotalAda     = prevTotalAda + depositLovelace;
   const ssadaToMint     = calcMintAmount(depositLovelace, prevTotalAda, prevTotalSsada);
   const newTotalSsada   = prevTotalSsada + ssadaToMint;
   const nowMs           = Date.now();
 
-  const newDatum = buildVaultDatumData(newTotalAda, newTotalSsada, vaultState?.strategy ?? "NativeStaking", nowMs);
+  const newDatum = buildVaultDatumData(newTotalAda, newTotalSsada, vaultState.strategy, nowMs);
 
-  // Redeemers
   const vaultRedeemer: Data = conStr0([]); // Deposit
   const mintRedeemer: Data = conStr0([
-    outputReference(
-      vaultUtxo?.input.txHash ?? "0".repeat(64),
-      vaultUtxo?.input.outputIndex ?? 0,
-    ),
+    outputReference(vaultUtxo.input.txHash, vaultUtxo.input.outputIndex),
   ]);
 
   const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
+  txBuilder.setNetwork("preprod");
 
-  // Spend vault UTxO (if exists)
-  if (vaultUtxo) {
-    txBuilder
-      .spendingPlutusScriptV3()
-      .txIn(
-        vaultUtxo.input.txHash,
-        vaultUtxo.input.outputIndex,
-        vaultUtxo.output.amount,
-        vaultUtxo.output.address,
-      )
-      .txInScript(VAULT_SCRIPT_CBOR)
-      .txInInlineDatumPresent()
-      .txInRedeemerValue(vaultRedeemer, "Mesh");
-  }
+  // applyCborEncoding double-wraps the CBOR so the Mesh SDK stores the original
+  // single-CBOR bytes in the witness set — the Cardano protocol hashes scripts
+  // as blake2b224(0x03 || cbor_bytes), so the CBOR wrapper must be preserved.
+  txBuilder
+    .spendingPlutusScriptV3()
+    .txIn(
+      vaultUtxo.input.txHash,
+      vaultUtxo.input.outputIndex,
+      vaultUtxo.output.amount,
+      vaultUtxo.output.address,
+    )
+    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInInlineDatumPresent()
+    .txInRedeemerValue(vaultRedeemer, "JSON");
 
   // Mint ssADA
   txBuilder
     .mintPlutusScriptV3()
     .mint(ssadaToMint.toString(), SSADA_POLICY_ID, SSADA_TOKEN_NAME)
-    .mintingScript(SSADA_MINT_SCRIPT_CBOR)
-    .mintRedeemerValue(mintRedeemer, "Mesh");
+    .mintingScript(applyCborEncoding(SSADA_MINT_SCRIPT_CBOR))
+    .mintRedeemerValue(mintRedeemer, "JSON");
 
   // Vault output with new datum + all ADA
   const vaultAdaOut = (vaultUtxo
@@ -219,29 +333,34 @@ export async function buildDepositTx(
 
   txBuilder
     .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: vaultLovelaceOut }])
-    .txOutInlineDatumValue(newDatum, "Mesh");
+    .txOutInlineDatumValue(newDatum, "JSON");
 
   // ssADA to user
   txBuilder.txOut(userAddress, [
     { unit: `${SSADA_POLICY_ID}${SSADA_TOKEN_NAME}`, quantity: ssadaToMint.toString() },
   ]);
 
-  // Change + user UTxOs
-  txBuilder.changeAddress(userAddress);
-  for (const utxo of userUtxos) {
-    txBuilder.txIn(
-      utxo.input.txHash,
-      utxo.input.outputIndex,
-      utxo.output.amount,
-      utxo.output.address,
-    );
-  }
+  txBuilder
+    .txInCollateral(
+      collateral.input.txHash,
+      collateral.input.outputIndex,
+      collateral.output.amount,
+      collateral.output.address,
+    )
+    .changeAddress(userAddress)
+    .selectUtxosFrom(userUtxos);
 
   const unsignedTx = await txBuilder.complete();
-  const signedTx   = await wallet.signTx(unsignedTx, true);
-  const txHash     = await wallet.submitTx(signedTx);
+  const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
 
-  return { txHash, ssadaMinted: ssadaToMint };
+  try {
+    const txHash = await provider.submitTx(signedTx);
+    return { txHash, ssadaMinted: ssadaToMint };
+  } catch (err) {
+    console.error("[buildDepositTx] submitTx raw error:", err);
+    const msg = (err as { info?: string })?.info ?? (err as { message?: string })?.message ?? JSON.stringify(err);
+    throw new Error(`Submit failed: ${msg}`);
+  }
 }
 
 // ── Withdraw ──────────────────────────────────────────────────────────────────
@@ -253,8 +372,11 @@ export async function buildWithdrawTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const [userAddress] = await wallet.getUsedAddresses();
-  const userUtxos = await wallet.getUtxos();
+  const userAddress = await wallet.getChangeAddressBech32();
+  if (!userAddress) throw new Error("Wallet not connected or no address found");
+  const userUtxos = await provider.fetchAddressUTxOs(userAddress);
+  if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
+  const collateral = await pickCollateral(wallet, userUtxos);
 
   const vaultUtxo = await fetchVaultUtxo();
   if (!vaultUtxo) throw new Error("No vault UTxO found");
@@ -272,6 +394,7 @@ export async function buildWithdrawTx(
   ]);
 
   const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
+  txBuilder.setNetwork("preprod");
 
   txBuilder
     .spendingPlutusScriptV3()
@@ -281,40 +404,46 @@ export async function buildWithdrawTx(
       vaultUtxo.output.amount,
       vaultUtxo.output.address,
     )
-    .txInScript(VAULT_SCRIPT_CBOR)
+    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
     .txInInlineDatumPresent()
-    .txInRedeemerValue(vaultRedeemer, "Mesh");
+    .txInRedeemerValue(vaultRedeemer, "JSON");
 
   // Burn ssADA
   txBuilder
     .mintPlutusScriptV3()
     .mint((-ssadaBurnAmount).toString(), SSADA_POLICY_ID, SSADA_TOKEN_NAME)
-    .mintingScript(SSADA_MINT_SCRIPT_CBOR)
-    .mintRedeemerValue(burnRedeemer, "Mesh");
+    .mintingScript(applyCborEncoding(SSADA_MINT_SCRIPT_CBOR))
+    .mintRedeemerValue(burnRedeemer, "JSON");
 
   // Vault output (reduced ADA)
   const vaultAdaOut = vaultUtxo.output.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0";
   const vaultLovelaceOut = (BigInt(vaultAdaOut) - adaToReturn).toString();
   txBuilder
     .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: vaultLovelaceOut }])
-    .txOutInlineDatumValue(newDatum, "Mesh");
+    .txOutInlineDatumValue(newDatum, "JSON");
 
   // ADA to user
   txBuilder.txOut(userAddress, [{ unit: "lovelace", quantity: adaToReturn.toString() }]);
 
-  txBuilder.changeAddress(userAddress);
-  for (const utxo of userUtxos) {
-    txBuilder.txIn(
-      utxo.input.txHash,
-      utxo.input.outputIndex,
-      utxo.output.amount,
-      utxo.output.address,
-    );
-  }
+  txBuilder
+    .txInCollateral(
+      collateral.input.txHash,
+      collateral.input.outputIndex,
+      collateral.output.amount,
+      collateral.output.address,
+    )
+    .changeAddress(userAddress)
+    .selectUtxosFrom(userUtxos);
 
   const unsignedTx = await txBuilder.complete();
-  const signedTx   = await wallet.signTx(unsignedTx, true);
-  const txHash     = await wallet.submitTx(signedTx);
+  const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
 
-  return { txHash, adaReturned: adaToReturn };
+  try {
+    const txHash = await provider.submitTx(signedTx);
+    return { txHash, adaReturned: adaToReturn };
+  } catch (err) {
+    console.error("[buildWithdrawTx] submitTx raw error:", err);
+    const msg = (err as { info?: string })?.info ?? (err as { message?: string })?.message ?? JSON.stringify(err);
+    throw new Error(`Submit failed: ${msg}`);
+  }
 }
