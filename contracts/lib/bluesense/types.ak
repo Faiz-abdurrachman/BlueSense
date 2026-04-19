@@ -19,6 +19,7 @@ pub type VaultDatum {
   strategy: Strategy,
   last_rebalance_ms: Int,
   ssada_policy_id: PolicyId,
+  yield_accrued_lovelace: Int,
 }
 
 // ── Vault redeemer ────────────────────────────────────────────────────────────
@@ -27,6 +28,7 @@ pub type VaultRedeemer {
   Deposit
   Withdraw
   Rebalance
+  InjectYield { amount_lovelace: Int }
 }
 
 // ── ssADA mint redeemer ───────────────────────────────────────────────────────

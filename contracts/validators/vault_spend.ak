@@ -1,6 +1,8 @@
 use aiken/collection/list
 use bluesense/oracle
-use bluesense/types.{Deposit, Rebalance, VaultDatum, VaultRedeemer, Withdraw}
+use bluesense/types.{
+  Deposit, InjectYield, Rebalance, VaultDatum, VaultRedeemer, Withdraw,
+}
 use cardano/assets
 use cardano/transaction.{InlineDatum, OutputReference, Transaction, find_input}
 
@@ -43,6 +45,7 @@ validator vault_spend {
           new_datum.total_ssada == vault_datum.total_ssada + minted,
           new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace + ada_in,
           new_datum.ssada_policy_id == vault_datum.ssada_policy_id,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
         }
       }
 
@@ -67,6 +70,7 @@ validator vault_spend {
           new_datum.total_ssada == vault_datum.total_ssada - burned,
           new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace - ada_out,
           new_datum.ssada_policy_id == vault_datum.ssada_policy_id,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
         }
       }
 
@@ -89,6 +93,30 @@ validator vault_spend {
           new_datum.total_ssada == vault_datum.total_ssada,
           new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace,
           new_datum.ssada_policy_id == vault_datum.ssada_policy_id,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
+        }
+      }
+
+      // InjectYield: permissionless yield simulation — caller injects ADA into
+      // the vault without minting ssADA, causing pricePerShare (ada/ssada) to
+      // rise for all holders. Accrued yield is tracked in the datum for APR
+      // calculation on the frontend.
+      InjectYield { amount_lovelace } -> {
+        expect Some(vault_output) =
+          list.find(tx.outputs, fn(out) { out.address == vault_address })
+        expect InlineDatum(raw_out) = vault_output.datum
+        expect new_datum: VaultDatum = raw_out
+        let vault_ada_new = assets.lovelace_of(vault_output.value)
+
+        and {
+          amount_lovelace > 0,
+          vault_ada_new == vault_datum.total_ada_lovelace + amount_lovelace,
+          new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace + amount_lovelace,
+          new_datum.total_ssada == vault_datum.total_ssada,
+          new_datum.strategy == vault_datum.strategy,
+          new_datum.last_rebalance_ms == vault_datum.last_rebalance_ms,
+          new_datum.ssada_policy_id == vault_datum.ssada_policy_id,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace + amount_lovelace,
         }
       }
     }

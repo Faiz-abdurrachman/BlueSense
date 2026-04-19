@@ -47,6 +47,7 @@ validator ssada_mint(vault_script_hash: ScriptHash) {
           new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace + ada_in,
           new_datum.total_ssada == vault_datum.total_ssada + expected_mint,
           new_datum.strategy == vault_datum.strategy,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
           // Policy ID in datum must match this minting policy
           new_datum.ssada_policy_id == policy_id,
           vault_datum.ssada_policy_id == policy_id,
@@ -87,6 +88,7 @@ validator ssada_mint(vault_script_hash: ScriptHash) {
           ada_returned >= expected_ada_out,
           new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace - expected_ada_out,
           new_datum.total_ssada == vault_datum.total_ssada - burn_amount,
+          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
           vault_datum.ssada_policy_id == policy_id,
           new_datum.ssada_policy_id == policy_id,
         }

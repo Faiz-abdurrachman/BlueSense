@@ -1,7 +1,7 @@
 # BlueSense
 
 > **Cardano yield aggregator vault with on-chain Charli3 oracle verification.**
-> Submitted to **Charli3 Oracles Hackathon 2026** (April 16–19, 2026).
+> Submitted to **Charli3 Oracles Hackathon 2026** (deadline May 19, 2026).
 
 BlueSense is a DeFi vault on Cardano that automatically routes deposits to the
 highest-yielding strategy (Native Staking / Liqwid / Minswap LP) based on live

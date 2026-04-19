@@ -8,7 +8,7 @@ import { useStrategyRecommendation } from "../hooks/useStrategyRecommendation";
 import { ORACLE_CONTRACT_ADDRESS } from "../services/charli3OracleService";
 import { forceRebalanceTo, type Strategy, type StrategyId } from "../services/strategyRouter";
 import { RebalanceAnimation } from "../components/RebalanceAnimation";
-import { buildDepositTx, buildWithdrawTx, buildRebalanceTx, fetchVaultUtxo, parseVaultState, SSADA_POLICY_ID, type Strategy as VaultStrategy } from "../services/vaultService";
+import { buildDepositTx, buildWithdrawTx, buildRebalanceTx, buildInjectYieldTx, fetchVaultUtxo, parseVaultState, initializeVault, SSADA_POLICY_ID, type Strategy as VaultStrategy, type VaultState } from "../services/vaultService";
 
 const STRATEGY_ID_TO_VAULT: Record<StrategyId, VaultStrategy> = {
   staking: "NativeStaking",
@@ -54,24 +54,27 @@ export function Dashboard() {
   const [rebalancing, setRebalancing] = useState(false);
   const [rebalanceTxHash, setRebalanceTxHash] = useState<string | null>(null);
 
-  // Live vault TVL — totalAdaLovelace from on-chain × ADA/USD from Charli3 oracle.
-  // Refresh every 30s and whenever a tx hash changes (post-deposit/withdraw/rebalance).
-  const [vaultLovelace, setVaultLovelace] = useState<bigint>(0n);
+  // Live vault state from chain — refreshes on tx changes + 30s interval.
+  const [vaultState, setVaultState] = useState<VaultState | null>(null);
+  const [yieldTxHash, setYieldTxHash] = useState<string | null>(null);
+  const [simulatingYield, setSimulatingYield] = useState(false);
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       const utxo = await fetchVaultUtxo();
       if (!utxo || cancelled) return;
       const state = parseVaultState(utxo);
-      if (state && !cancelled) setVaultLovelace(state.totalAdaLovelace);
+      if (state && !cancelled) setVaultState(state);
     };
     load();
     const interval = setInterval(load, 30_000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [txHash, rebalanceTxHash]);
+  }, [txHash, rebalanceTxHash, yieldTxHash]);
 
+  const vaultLovelace = vaultState?.totalAdaLovelace ?? 0n;
   const vaultAdaTotal = Number(vaultLovelace) / 1_000_000;
   const vaultTvlUsd = vaultAdaTotal * recommendation.adaPrice;
+  const yieldAccruedAda = Number(vaultState?.yieldAccruedLovelace ?? 0n) / 1_000_000;
   const formatTvl = (usd: number): string => {
     if (usd === 0) return "$0.00";
     if (usd >= 1_000_000) return `$${(usd / 1_000_000).toFixed(2)}M`;
@@ -119,7 +122,12 @@ export function Dashboard() {
     }
   }, [recommendation.shouldRebalance, recommendation.reason]);
 
-  const pricePerShare = 1.025;
+  // Live pricePerShare from on-chain vault — totalAda / totalSsada. Rises after
+  // every InjectYield tx (yield simulation), reflecting real compounding on-chain.
+  const pricePerShare =
+    vaultState && vaultState.totalSsada > 0n
+      ? Number(vaultState.totalAdaLovelace) / Number(vaultState.totalSsada)
+      : 1;
 
   const liqwidAPY   = recommendation.allStrategies.find((s) => s.id === "liqwid")?.apy   ?? 0.125;
   const stakingAPY  = recommendation.allStrategies.find((s) => s.id === "staking")?.apy  ?? 0.042;
@@ -214,6 +222,37 @@ export function Dashboard() {
     }
   };
 
+  const [initializing, setInitializing] = useState(false);
+  const handleInitVault = async () => {
+    if (!connected || !wallet) return;
+    setInitializing(true);
+    setTxError(null);
+    try {
+      const txHash = await initializeVault(wallet);
+      setTxHash(txHash);
+    } catch (err) {
+      setTxError(err instanceof Error ? err.message : "Init failed");
+    } finally {
+      setInitializing(false);
+    }
+  };
+
+  const handleSimulateYield = async () => {
+    if (!connected || !wallet) return;
+    setSimulatingYield(true);
+    setYieldTxHash(null);
+    setTxError(null);
+    try {
+      // Inject 0.5 ADA as simulated yield — rises pricePerShare for all holders.
+      const result = await buildInjectYieldTx(wallet, 0.5);
+      setYieldTxHash(result.txHash);
+    } catch (err) {
+      setTxError(err instanceof Error ? err.message : "Yield simulation failed");
+    } finally {
+      setSimulatingYield(false);
+    }
+  };
+
   const handleWithdraw = async () => {
     if (!connected || !wallet || ssAdaTokens === 0n) return;
 
@@ -302,6 +341,28 @@ export function Dashboard() {
                 Updated {Math.floor((Date.now() - recommendation.lastUpdated.getTime()) / 1000)}s ago
               </span>
             )}
+            {!vaultState && connected && (
+              <button
+                onClick={handleInitVault}
+                disabled={initializing}
+                title="Vault UTxO not found. Init deposits 2 ADA seed so Deposit/Rebalance/InjectYield flows can run."
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-[12px] font-bold rounded-lg transition-colors shadow-sm flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {initializing ? (
+                  <>
+                    <svg className="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    Initializing…
+                  </>
+                ) : (
+                  <>
+                    <span>🚀</span> Init Vault
+                  </>
+                )}
+              </button>
+            )}
             <button
               onClick={handleForceRebalance}
               disabled={rebalancing}
@@ -318,6 +379,26 @@ export function Dashboard() {
               ) : (
                 <>
                   <span>⚡</span> Force Rebalance
+                </>
+              )}
+            </button>
+            <button
+              onClick={handleSimulateYield}
+              disabled={simulatingYield || !connected}
+              title="Injects 0.5 ADA into the vault as simulated yield. pricePerShare rises for all ssADA holders."
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white text-[12px] font-bold rounded-lg transition-colors shadow-sm flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {simulatingYield ? (
+                <>
+                  <svg className="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  Injecting…
+                </>
+              ) : (
+                <>
+                  <span>🎲</span> Simulate Yield
                 </>
               )}
             </button>
@@ -369,6 +450,41 @@ export function Dashboard() {
               <button
                 onClick={() => setRebalanceTxHash(null)}
                 className="text-blue-400 hover:text-blue-600 text-lg flex-shrink-0"
+              >
+                ×
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Yield Injection Tx Banner */}
+        <AnimatePresence>
+          {yieldTxHash && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="flex items-start gap-3 bg-emerald-50 border border-emerald-200 rounded-xl px-5 py-3.5 mb-5 shadow-sm"
+            >
+              <span className="text-emerald-500 mt-0.5 flex-shrink-0">🎲</span>
+              <div className="flex-1">
+                <p className="text-[13px] font-bold text-emerald-800">Yield Injected On-Chain</p>
+                <p className="text-[12px] text-emerald-700 mt-0.5">
+                  Vault ADA grew — pricePerShare now <span className="font-mono font-bold">{pricePerShare.toFixed(4)}</span>.
+                  Total yield accrued: <span className="font-mono font-bold">{yieldAccruedAda.toFixed(4)} ADA</span>.
+                </p>
+                <a
+                  href={`https://preprod.cardanoscan.io/transaction/${yieldTxHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[12px] font-mono text-emerald-700 hover:underline break-all"
+                >
+                  {yieldTxHash.slice(0, 24)}…{yieldTxHash.slice(-10)}
+                </a>
+              </div>
+              <button
+                onClick={() => setYieldTxHash(null)}
+                className="text-emerald-400 hover:text-emerald-600 text-lg flex-shrink-0"
               >
                 ×
               </button>
