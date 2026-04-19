@@ -2,7 +2,6 @@
 // Run with: node scripts/compute_addresses.mjs
 import {
   applyParamsToScript,
-  applyCborEncoding,
   resolveScriptHash,
   serializePlutusScript,
 } from "@meshsdk/core";
@@ -11,8 +10,7 @@ import fs from "node:fs";
 const bp = JSON.parse(fs.readFileSync("/tmp/blueprints.json", "utf8"));
 
 const vaultCbor = bp.vault_cbor;
-const vaultCborEncoded = applyCborEncoding(vaultCbor);
-const vaultScriptHash = resolveScriptHash(vaultCborEncoded, "V3");
+const vaultScriptHash = resolveScriptHash(vaultCbor, "V3");
 const vaultAddress = serializePlutusScript(
   { code: vaultCbor, version: "V3" },
   undefined,
@@ -27,8 +25,7 @@ const ssadaAppliedCbor = applyParamsToScript(
   [JSON.stringify({ bytes: vaultScriptHash })],
   "JSON",
 );
-const ssadaAppliedCborEncoded = applyCborEncoding(ssadaAppliedCbor);
-const ssadaPolicyId = resolveScriptHash(ssadaAppliedCborEncoded, "V3");
+const ssadaPolicyId = resolveScriptHash(ssadaAppliedCbor, "V3");
 
 console.log(JSON.stringify({
   VAULT_SCRIPT_CBOR: vaultCbor,

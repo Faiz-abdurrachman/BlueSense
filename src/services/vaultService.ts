@@ -2,50 +2,70 @@
 // Builds and submits Deposit / Withdraw / Rebalance / InjectYield transactions using MeshTxBuilder.
 //
 // Contract addresses (Cardano Preprod, redeployed for yield simulation):
-//   vault_spend  → addr_test1wz8gywuctaraf0sd2nl9z3ut764c2k7cx5h2zf4q9fq2y5czjazyv
-//   ssada_mint   → policy b206d33e09e660750c31d08ab540781c8f3f04eced2f14f7ff8e479a
+//   vault_spend  → addr_test1wp45fdd7jtf39aur9w0ult3x8vdznvje8afwp35rcxcc6usd5rs5s
+//   ssada_mint   → policy 2d9166aa86e60cfa77b6c598518908040e2b69aeea391b3e01f25f63
 
 import {
   BlockfrostProvider,
   MeshTxBuilder,
-  applyCborEncoding,
+  type BuilderData,
   conStr0,
   conStr1,
   conStr2,
   conStr3,
+  deserializeAddress,
   integer,
   byteString,
   outputReference,
+  resolveScriptHash,
   type UTxO,
-  type Data,
 } from "@meshsdk/core";
-import type { MeshCardanoBrowserWallet } from "@meshsdk/wallet";
 import { bech32 } from "bech32";
 import { ORACLE_CONTRACT_ADDRESS } from "./charli3OracleService";
 
-// CIP-30 wallets return addresses as raw hex bytes; Blockfrost needs bech32.
+interface MeshCardanoBrowserWallet {
+  getCollateral(): Promise<unknown[] | undefined>;
+  getChangeAddress(): Promise<string>;
+  signTx(tx: string, partialSign: boolean): Promise<string>;
+  getChangeAddressBech32?(): Promise<string>;
+  signTxReturnFullTx?(tx: string, partialSign: boolean): Promise<string>;
+}
+
 function normalizeAddress(addr: string): string {
   if (addr.startsWith("addr")) return addr;
   const bytes = Buffer.from(addr, "hex");
   const words = bech32.toWords(bytes);
-  // header byte 0x00–0x0f = testnet, 0x10–0x1f = mainnet
   const isMainnet = (bytes[0] & 0x0f) === 1;
   return bech32.encode(isMainnet ? "addr" : "addr_test", words, 1000);
+}
+
+async function getChangeAddressBech32(wallet: MeshCardanoBrowserWallet): Promise<string> {
+  if (wallet.getChangeAddressBech32) return wallet.getChangeAddressBech32();
+  return normalizeAddress(await wallet.getChangeAddress());
+}
+
+async function signTxReturnFullTx(
+  wallet: MeshCardanoBrowserWallet,
+  unsignedTx: string,
+  partialSign: boolean,
+): Promise<string> {
+  if (wallet.signTxReturnFullTx) {
+    return wallet.signTxReturnFullTx(unsignedTx, partialSign);
+  }
+  return wallet.signTx(unsignedTx, partialSign);
 }
 
 // ── Contract constants ────────────────────────────────────────────────────────
 
 export const VAULT_ADDRESS =
   import.meta.env.VITE_VAULT_ADDRESS ??
-  "addr_test1wz8gywuctaraf0sd2nl9z3ut764c2k7cx5h2zf4q9fq2y5czjazyv";
+  "addr_test1wqkmpw9cktz6z6df4a0ykkalyznj7nza4vrp282sgj43rwgfuylyz";
 
 export const VAULT_SCRIPT_HASH =
-  import.meta.env.VITE_VAULT_SCRIPT_HASH ??
-  "3fd462699e2d67d6610312ef3f866cb722c1d03a40cce931ec06e34b";
+  "2db0b8b8b2c5a169a9af5e4b5bbf20a72f4c5dab06151d5044ab11b9";
 
 export const SSADA_POLICY_ID =
-  import.meta.env.VITE_SSADA_POLICY_ID ??
-  "b206d33e09e660750c31d08ab540781c8f3f04eced2f14f7ff8e479a";
+  "637e37e38273ba333921cf5a1fd3e75e0a67e04d34800f3cc4d9750a";
 
 export const SSADA_TOKEN_NAME =
   import.meta.env.VITE_SSADA_TOKEN_NAME ?? "737341444100";
@@ -61,10 +81,10 @@ const ORACLE_FEED_ASSET =
 
 // Compiled scripts from plutus.json (vault_spend) and blueprint apply (ssada_mint)
 const VAULT_SCRIPT_CBOR =
-  "59097301010029800aba2aba1aba0aab9faab9eaab9dab9a488888896600264653001300800198041804800cdc3a400530080024888966002600460106ea800e3300130093754007370e90004dc3a40093008375400891111991192cc004c0180122b3001301037540170018b20228acc004c0240122b3001301037540170018b20228acc004c0140122b3001301037540170018b20228acc004cdc3a400c0091323259800980b001400e2c8098dd6980a00098081baa00b8b201c4038807100e0acc004c014c038dd5000c4c8cc8966002601060226ea800a330012301630170019180b180b980b980b980b980b800c8c058c05cc05cc05cc05c0064602c602e602e602e003222323322330020020012259800800c00e2646644b30013372200e00515980099b8f0070028800c01901944cc014014c07c0110191bae3018001375a6032002603600280c8c8c8cc004004018896600200300389919912cc004cdc8804801456600266e3c02400a20030064069133005005302000440686eb8c064004dd5980d000980e000a03414bd6f7b6300a40012259800980518099baa00289919191919194c004dd6980e800cdd6980e8034dd6980e802cdd6980e801cdd7180e801244444b30013023006899192cc004c05c0062b30013021375400500e8b20448acc004c0680062b30013021375400500e8b20448acc004c0580062b30013021375400500e8b20448b203e407c80f8c07cdd50009811004c590200c074004c070004c06c004c068004c064004c050dd500145901248c058c05cc05c00660226ea80366e2120009b80375a602a60246ea80052222222222332259800980a002c4cc8966002602c603e6ea800626464b30013017302137540031323300c0011325980098050034566002601400315980099b87375a602460486ea8008cdc01bad30123024375402600d15980099b87375a604e60486ea8008c0240062b30013371e6eb8c040c090dd50011bae30103024375402713370e6eb4c044c090dd50011bad30113024375402714a081122941022452820448a50408914a08110cdc098031bab3011302337540066eb4c098c08cdd5009181298111baa0018b2040300930213754002604660406ea80062c80f260026eacc028c078dd500b4dd71805180f1baa00da441067373414441000040206601e6eb0c018c078dd500b119baf3022301f3754002007159800980b802c4cc8966002602c603e6ea800626464b30013017302137540031323300c0011325980098050034566002601400315980099b87375a602460486ea8008cdc09bad30123024375402600d15980099b87375a604e60486ea8008cdc09bad30273024375402600315980099b8f375c602060486ea8008dd7180818121baa013899b87375a602260486ea8008dd6980898121baa0138a50408914a081122941022452820448a50408866e04dd6981318119baa01230063756602260466ea800cc094c088dd5000c59020180498109baa00130233020375400316407866e05200098009bab300a301e375402d375c6014603c6ea80369101067373414441000040206601e6eb0c018c078dd500b119baf3022301f37540020071598009809802c4c9660026028603c6ea80062b30013259800980c980f9baa001899b88375a604660406ea8004dd6981198121919912cc004c064c088dd5000c4c9660026050003132332259800980e800c4c8c966002605a0050048b2054302b001302737540071598009810000c4c8c966002605a0050048b2054302b00130273754007159800980e000c4c9660026058003132330010013756605800444b3001001802c4c8cc88cc014014c0c4010dd6981500098158009816800a0568b2052302737540071640948129025099198141ba83300500148000cc0a0dd419802800a4008660506ea0c966002603a604c6ea800626eb4c0a8c09cdd5000c5200c40946600c002900325eb80c9660026036003137566052604c6ea800a2b3001301c0018b45902420483024375400260486ea8004c09c0062c8128c08cdd5000c5902111192cc004c068c08cdd5000c4dd6981398121baa0018b20443300300200130243021375400644646600200200644b30010018a6103d87a80008992cc004cdc39bad3024001004899ba548000cc09cc0940052f5c11330030033029002408c604e002812a294101e1811180f9baa300d301f375460446046604660466046604660466046603e6ea805e264b30013016301f37540031323259800980b98109baa001899198060008acc004cdc398031bab3011302337540066eb4c098c08cdd5009456600266e20dd6980718119baa012375a601c60466ea80062b30013370e6eb4c044c08cdd50009bad30113023375402515980099b87375a604c60466ea8004dd6981318119baa0128acc004cdc79bae300f302337540026eb8c03cc08cdd500944cdc39bad3010302337540026eb4c040c08cdd5009452820428a50408514a0810a294102145282042302530223754003164080601260426ea8004c08cc080dd5000c5901e198081bac3007301f375402e466ebcc08cc080dd500080245901d45901d1803180f1baa300c301e375464b30013015301e375400313022301f37540031640746601e6eb0c030c078dd500b1180c4c004dd59806980f9baa300d301f375400348811c1116903479e7320b8e4592207aaebf627898267fcd80e2d9646cbf0700a4410a4f7261636c65466565640040251332259800980b180f9baa001899192cc004c05cc084dd5000c4c8cc030004566002601200b15980099b8730063756602260466ea800cc0200162b30013370e6eb4c098c08cdd50009804002c56600266e1cdd6980898119baa001375a602260466ea804a2b30013375e601660466ea8004c02cc08cdd5009456600266e1cdd6980718119baa001375a601c60466ea804a2b30013371e6eb8c03cc08cdd50009bae300f3023375402513370e6eb4c040c08cdd500099b80375a602060466ea80480162941021452820428a50408514a0810a2941021452820428a504084604a60446ea80062c8100c024c084dd5000981198101baa0018b203c375a6042603c6ea8064cc03cdd61803180f1baa01623375e6044603e6ea800400d01c20384070603e60386ea8c028c070dd5180f980e1baa00c29800800d22100a44100401c8b2020330013758602660206ea80208cdd7980a18089baa00100430133010375400444646600200200644b30010018a60103d87a80008992cc004c010006266e952000330160014bd7044cc00c00cc060009012180b000a0288b201a3010004301030110044590070c020004c00cdd5004452689b2b20021";
+  "5908f301010029800aba2aba1aba0aab9faab9eaab9dab9a488888896600264653001300800198041804800cdc3a400530080024888966002600460106ea800e3300130093754007370e90004dc3a40093008375400891111991192cc004c0180122b3001301037540170018b20228acc004c0240122b3001301037540170018b20228acc004c0140122b3001301037540170018b20228acc004cdc3a400c0091323259800980b001400e2c8098dd6980a00098081baa00b8b201c4038807100e0acc004c014c038dd5000c4c8cc8966002601060226ea800a330013015301237540052301630170019180b180b980b980b980b980b800c8c058c05cc05cc05cc05c0064602c602e602e602e003222323322330020020012259800800c00e2646644b30013372200e00515980099b8f0070028800c01901944cc014014c07c0110191bae3018001375a6032002603600280c8c8c8cc004004018896600200300389919912cc004cdc8804801456600266e3c02400a20030064069133005005302000440686eb8c064004dd5980d000980e000a03414bd6f7b6300a40012259800980518099baa00289919191919194c004dd6980e800cdd6980e8034dd6980e802cdd6980e801cdd7180e801244444b30013023006899192cc004c05c0062b30013021375400500e8b20448acc004c0680062b30013021375400500e8b20448acc004c0580062b30013021375400500e8b20448b203e407c80f8c07cdd50009811004c590200c074004c070004c06c004c068004c064004c050dd500145901248c058c05cc05c00660226ea80366e21200048888888888cc8966002602800913259800980a980f1baa0018acc004c01260026eacc028c07cdd500bcdd71805180f9baa00ea4506737341444100004021130043370260046eacc030c07cdd51811180f9baa001300237566018603e6ea8c030c07cdd5006c528203a8b203a3300f3758600a603c6ea80588cdd79811180f9baa0010038acc004c05c01226644b30013016301f37540031323259800980b98109baa001899198058008992cc004c02401a2b300130090018acc004cdc39bad30113024375400466e04dd6980898121baa0130068acc004cdc39bad30273024375400466e04dd6981398121baa0130018acc004cdc79bae300f302437540046eb8c03cc090dd5009c4cdc39bad3010302437540046eb4c040c090dd5009c52820448a50408914a0811229410224528204433702600c6eacc040c08cdd5180818119baa01130063756602060466ea800cc094c088dd5000c59020180418109baa00130233020375400316407866e05200098009bab3009301e375402d375c6012603c6ea803691010673734144410000401c6601e6eb0c014c078dd500b119baf3022301f3754002007159800980980244c9660026028603c6ea80062b30013259800980c980f9baa001899b88375a604660406ea8004dd6981198121919912cc004c064c088dd5000c4c9660026050003132332259800980e800c4c8c966002605a0050048b2054302b001302737540071598009810000c4c8c966002605a0050048b2054302b00130273754007159800980e000c4c9660026058003132330010013756605800444b3001001802c4c8cc88cc014014c0c4010dd6981500098158009816800a0568b2052302737540071640948129025099198141ba83300500148000cc0a0dd419802800a4008660506ea0c966002603a604c6ea800626eb4c0a8c09cdd5000c5200c40946600c002900325eb80c9660026036003137566052604c6ea800a2b3001301c0018b45902420483024375400260486ea8004c09c0062c8128c08cdd5000c5902111192cc004c068c08cdd5000c4dd6981398121baa0018b20443300300200130243021375400644646600200200644b30010018a6103d87a80008992cc004cdc39bad3024001004899ba548000cc09cc0940052f5c11330030033029002408c604e002812a294101e1811180f9baa300c301f375460446046604660466046604660466046603e6ea805e264b30013016301f37540031323259800980b98109baa001899198058008acc004cdc398031bab3010302337540066eb4c098c08cdd5009456600266e20dd6980698119baa012375a601a60466ea80062b30013370e6eb4c040c08cdd50009bad30103023375402515980099b87375a604c60466ea8004dd6981318119baa0128acc004cdc79bae300e302337540026eb8c038c08cdd500944cdc39bad300f302337540026eb4c03cc08cdd5009452820428a50408514a0810a294102145282042302530223754003164080601060426ea8004c08cc080dd5000c5901e198081bac3006301f375402e466ebcc08cc080dd500080245901d45901d1802980f1baa300b301e375464b30013015301e375400313022301f37540031640746601e6eb0c02cc078dd500b1180c4c004dd59806180f9baa300c301f375400348811c1116903479e7320b8e4592207aaebf627898267fcd80e2d9646cbf0700a4410a4f7261636c65466565640040211332259800980b180f9baa001899192cc004c05cc084dd5000c4c8cc02c004566002601000b15980099b8730063756602060466ea800ccdc01bad30263023375402400b15980099b87375a604c60466ea8004cdc01bad30263023375402400b15980099b87375a602060466ea8004dd6980818119baa0128acc004cdd7980518119baa001300a3023375402515980099b87375a601a60466ea8004dd6980698119baa0128acc004cdc79bae300e302337540026eb8c038c08cdd500944cdc39bad300f3023375400266e00dd6980798119baa0120058a50408514a0810a2941021452820428a50408514a0810a2941021181298111baa0018b2040300830213754002604660406ea80062c80f0dd69810980f1baa0193300f3758600a603c6ea80588cdd79811180f9baa001003407080e101c180f980e1baa3009301c375401453001001a4500a4410040188b2020330013758602660206ea80208cdd7980a18089baa00100430133010375400444646600200200644b30010018a60103d87a80008992cc004c010006266e952000330160014bd7044cc00c00cc060009012180b000a0288b201a3010004301030110044590070c020004c00cdd5004452689b2b20021";
 
 const SSADA_MINT_SCRIPT_CBOR =
-  "5906435906400101003229800aba2aba1aba0aab9faab9eaab9dab9a9bae0024888888896600264653001300900198049805000cdc3a400130090024888966002600460126ea800e2653001198009180798081808180818081808000c888c8cc88cc008008004896600200300389919912cc004cdc8803801456600266e3c01c00a20030064049133005005301800440486eb8c044004dd69809000980a000a0243232330010010062259800800c00e2646644b30013372201200515980099b8f0090028800c01901344cc014014c0640110131bae301200137566026002602a002809852f5bded8c02900048c03cc040c040c040c0400066e1d2004918079808000c8c03cc040c04000644646600200200644b30010018a6103d87a80008992cc004c010006266e952000330120014bd7044cc00c00cc05000900e1809000a0204888888a600253001001a44100a44100401d2259800980618099baa00289919191919194c004dd6980e800cdd6980e8034dd6980e802cdd6980e801cdd7180e801244444b30013023006899192cc004c0640062b30013021375400500e8b20448acc004cdc3a400400315980098109baa0028074590224566002602600315980098109baa00280745902245901f203e407c603e6ea8004c0880262c8100603a002603800260360026034002603200260286ea800a2c80924466006004466ebcc060c054dd50008012444b3001300d3014375401f132598009807180a9baa001899192cc004c028c05cdd5000c4c8cc0180044c966002602460326ea800626464b3001300e301b37540031323300a001132325980099b884800000a2b30013370f300137566024603e6ea805a02b4890673734144410000404c00315980099b87375a6044603e6ea800ccdc01bad3022301f375400e00515980099b87375a6020603e6ea800ccdc01bad3010301f375400e00315980099baf300f301f3754006601e603e6ea801e2b30013370e6eb4c050c07cdd50019bad3014301f375400f15980099b8f375c6024603e6ea800c056266e3cdd71809180f9baa0070158a50407514a080ea294101d4528203a8a50407514a080ea294101d19912cc00566002603000314a31301800240791003899b833370400600200480f0dd69810980f1baa006375a601e603c6ea8018cdc098059bab300e301d375400660166eacc038c074dd51807180e9baa007301f301c3754003164068601660366ea8004c074c068dd5000c59018198041bac300930193754020466ebcc074c068dd5180e980d1baa0013374a90011980e1ba90174bd70180d980c1baa0018b202c3007301737546010602e6ea8004c064c058dd5000c59014198009bac3018301537540186030602a6ea803e264b3001300e3015375400313232598009805180b9baa0018991980300089919912cc004c050c06cdd5000c4c8c9660026020603a6ea8006264660180022b3001337109000003456600266e24014cdc098069bab3010301f37546020603e6ea8024c034dd59808180f9baa0038acc004cdc39bad3022301f375400266e04dd69811180f9baa0070058acc004cdc39bad3010301f375400266e04dd69808180f9baa0070068acc004cdc39bad3014301f37540026eb4c050c07cdd5003c56600266e3cdd71809180f9baa007015899b8f375c6024603e6ea8004056294101d4528203a8a50407514a080ea294101d4528203a3021301e3754003164070601a603a6ea8004c07cc070dd5000c5901a19b83337040026eb4c074c068dd50011bad300b301a3754004660126eb0c028c068dd5008919baf301e301b3754603c60366ea8004cdd2a40046603a6ea40612f5c066e05200098009bab300c3019375402100fa44106737341444100004034603660306ea80062c80b0c01cc05cdd51804180b9baa001301930163754003164050660026eb0c060c054dd5006180c180a9baa00f404c4c028dd5002c8966002600a60186ea800a264646644b30013015003802c590121bad3012001375c60240046024002601a6ea800a2c805922259800980300144c966002602600313300230120010048b2020300e375401115980099b874800800a264b30013013001899801180900080245901018071baa0088b20184030375c601a60146ea800e2c8040601200260086ea802629344d95900213011e581c3fd462699e2d67d6610312ef3f866cb722c1d03a40cce931ec06e34b0001";
+  "5906435906400101003229800aba2aba1aba0aab9faab9eaab9dab9a9bae0024888888896600264653001300900198049805000cdc3a400130090024888966002600460126ea800e2653001198009180798081808180818081808000c888c8cc88cc008008004896600200300389919912cc004cdc8803801456600266e3c01c00a20030064049133005005301800440486eb8c044004dd69809000980a000a0243232330010010062259800800c00e2646644b30013372201200515980099b8f0090028800c01901344cc014014c0640110131bae301200137566026002602a002809852f5bded8c02900048c03cc040c040c040c0400066e1d2004918079808000c8c03cc040c04000644646600200200644b30010018a6103d87a80008992cc004c010006266e952000330120014bd7044cc00c00cc05000900e1809000a0204888888a600253001001a44100a44100401d2259800980618099baa00289919191919194c004dd6980e800cdd6980e8034dd6980e802cdd6980e801cdd7180e801244444b30013023006899192cc004c0640062b30013021375400500e8b20448acc004cdc3a400400315980098109baa0028074590224566002602600315980098109baa00280745902245901f203e407c603e6ea8004c0880262c8100603a002603800260360026034002603200260286ea800a2c80924466006004466ebcc060c054dd50008012444b3001300d3014375401f132598009807180a9baa001899192cc004c028c05cdd5000c4c8cc0180044c966002602460326ea800626464b3001300e301b37540031323300a001132325980099b884800000a2b30013370f300137566024603e6ea805a02b4890673734144410000404c00315980099b87375a6044603e6ea800ccdc01bad3022301f375400e00515980099b87375a6020603e6ea800ccdc01bad3010301f375400e00315980099baf300f301f3754006601e603e6ea801e2b30013370e6eb4c050c07cdd50019bad3014301f375400f15980099b8f375c6024603e6ea800c056266e3cdd71809180f9baa0070158a50407514a080ea294101d4528203a8a50407514a080ea294101d19912cc00566002603000314a31301800240791003899b833370400600200480f0dd69810980f1baa006375a601e603c6ea8018cdc098059bab300e301d375400660166eacc038c074dd51807180e9baa007301f301c3754003164068601660366ea8004c074c068dd5000c59018198041bac300930193754020466ebcc074c068dd5180e980d1baa0013374a90011980e1ba90174bd70180d980c1baa0018b202c3007301737546010602e6ea8004c064c058dd5000c59014198009bac3018301537540186030602a6ea803e264b3001300e3015375400313232598009805180b9baa0018991980300089919912cc004c050c06cdd5000c4c8c9660026020603a6ea8006264660180022b3001337109000003456600266e24014cdc098069bab3010301f37546020603e6ea8024c034dd59808180f9baa0038acc004cdc39bad3022301f375400266e04dd69811180f9baa0070058acc004cdc39bad3010301f375400266e04dd69808180f9baa0070068acc004cdc39bad3014301f37540026eb4c050c07cdd5003c56600266e3cdd71809180f9baa007015899b8f375c6024603e6ea8004056294101d4528203a8a50407514a080ea294101d4528203a3021301e3754003164070601a603a6ea8004c07cc070dd5000c5901a19b83337040026eb4c074c068dd50011bad300b301a3754004660126eb0c028c068dd5008919baf301e301b3754603c60366ea8004cdd2a40046603a6ea40612f5c066e05200098009bab300c3019375402100fa44106737341444100004034603660306ea80062c80b0c01cc05cdd51804180b9baa001301930163754003164050660026eb0c060c054dd5006180c180a9baa00f404c4c028dd5002c8966002600a60186ea800a264646644b30013015003802c590121bad3012001375c60240046024002601a6ea800a2c805922259800980300144c966002602600313300230120010048b2020300e375401115980099b874800800a264b30013013001899801180900080245901018071baa0088b20184030375c601a60146ea800e2c8040601200260086ea802629344d95900213011e581c2db0b8b8b2c5a169a9af5e4b5bbf20a72f4c5dab06151d5044ab11b90001";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -75,6 +95,7 @@ export interface VaultState {
   totalSsada: bigint;
   strategy: Strategy;
   lastRebalanceMs: number;
+  ssadaPolicyId: string;
   yieldAccruedLovelace: bigint;
   utxo: UTxO;
 }
@@ -105,9 +126,9 @@ async function pickCollateral(
   // Eternl sometimes returns entries without a fully-hydrated `.output.amount`
   // (observed: `Cannot read properties of undefined (reading 'amount')`). Guard
   // the access; if shape is unexpected, fall through to walletUtxos-based pick.
-  const first = explicit[0];
+  const first = explicit?.[0] as Partial<UTxO> | undefined;
   if (first?.output?.amount) {
-    return { utxo: first, multiAsset: first.output.amount.length > 1 };
+    return { utxo: first as UTxO, multiAsset: first.output.amount.length > 1 };
   }
   const MIN_COLLATERAL = 5_000_000n;
   const lovelaceOf = (u: UTxO) => {
@@ -132,13 +153,18 @@ async function pickCollateral(
 // Standard Plutus collateral amount (5 ADA). Used when setTotalCollateral is required.
 const COLLATERAL_AMOUNT_LOVELACE = "5000000";
 
+const ACTIVE_VAULT_SCRIPT_CBOR = VAULT_SCRIPT_CBOR;
+const ACTIVE_SSADA_MINT_SCRIPT_CBOR = SSADA_MINT_SCRIPT_CBOR;
+const ACTIVE_VAULT_SCRIPT_HASH = resolveScriptHash(applyCborEncoding(ACTIVE_VAULT_SCRIPT_CBOR), "V3");
+const ACTIVE_SSADA_POLICY_ID = resolveScriptHash(applyCborEncoding(ACTIVE_SSADA_MINT_SCRIPT_CBOR), "V3");
+
 // ── Datum encoding ────────────────────────────────────────────────────────────
 
-function strategyData(s: Strategy): Data {
+function strategyData(s: Strategy): BuilderData["content"] {
   switch (s) {
-    case "NativeStaking":  return conStr0([]);
-    case "LiqwidLending":  return conStr1([]);
-    case "MinswapLP":      return conStr2([]);
+    case "NativeStaking": return conStr0([]);
+    case "LiqwidLending": return conStr1([]);
+    case "MinswapLP": return conStr2([]);
   }
 }
 
@@ -148,17 +174,17 @@ export function buildVaultDatumData(
   strategy: Strategy,
   lastRebalanceMs: number,
   yieldAccruedLovelace: bigint,
-): Data {
+): BuilderData["content"] {
   // conStr0 produces { constructor, fields } — compatible with "JSON" format only.
   // "Mesh" format reads .alternative (wrong key) → always use "JSON" for serialization.
   return conStr0([
     integer(Number(totalAdaLovelace)),
     integer(Number(totalSsada)),
-    strategyData(strategy),
+    strategyData(strategy) as never,
     integer(lastRebalanceMs),
     byteString(SSADA_POLICY_ID),
     integer(Number(yieldAccruedLovelace)),
-  ]);
+  ]) as unknown as BuilderData["content"];
 }
 
 // ── Datum decoding ────────────────────────────────────────────────────────────
@@ -183,30 +209,17 @@ function readCborUint(bytes: Uint8Array, offset: number): [bigint, number] {
   return [v, offset + 1 + w];
 }
 
-// Skip a CBOR bytestring (major type 2) — returns offset past the last byte.
-function skipCborBytes(bytes: Uint8Array, offset: number): number {
-  const header = bytes[offset];
-  if ((header & 0xe0) !== 0x40) throw new Error("not a CBOR bstr");
-  const info = header & 0x1f;
-  if (info < 24) return offset + 1 + info;
-  const widths: Record<number, number> = { 24: 1, 25: 2, 26: 4, 27: 8 };
-  const w = widths[info];
-  if (!w) throw new Error(`unsupported bstr info ${info}`);
-  let len = 0;
-  for (let i = 1; i <= w; i++) len = (len << 8) | bytes[offset + i];
-  return offset + 1 + w + len;
-}
-
 // Decode the on-chain VaultDatum: Constr(0, [Int, Int, Constr(n, []), Int, ByteString, Int]).
 // Matches encoding produced by buildVaultDatumData().
 function decodeVaultDatum(hexCbor: string):
   | {
-      totalAdaLovelace: bigint;
-      totalSsada: bigint;
-      strategy: Strategy;
-      lastRebalanceMs: number;
-      yieldAccruedLovelace: bigint;
-    }
+    totalAdaLovelace: bigint;
+    totalSsada: bigint;
+    strategy: Strategy;
+    lastRebalanceMs: number;
+    ssadaPolicyId: string;
+    yieldAccruedLovelace: bigint;
+  }
   | null {
   try {
     const bytes = Uint8Array.from(Buffer.from(hexCbor, "hex"));
@@ -221,19 +234,102 @@ function decodeVaultDatum(hexCbor: string):
     if (bytes[i++] !== 0x80) return null;
     const strategy = strategyFromIndex(strategyTag - 0x79);
     const [lastRebalance, i3] = readCborUint(bytes, i); i = i3;
-    i = skipCborBytes(bytes, i); // ssada_policy_id (28-byte hash) — not needed at runtime
+    const [policyBytes, i4] = extractCborBytes(bytes, i); i = i4;
+    const ssadaPolicyId = Buffer.from(policyBytes).toString("hex");
     const [yieldAccrued] = readCborUint(bytes, i);
     return {
       totalAdaLovelace,
       totalSsada,
       strategy,
       lastRebalanceMs: Number(lastRebalance),
+      ssadaPolicyId,
       yieldAccruedLovelace: yieldAccrued,
     };
   } catch {
     return null;
   }
 }
+
+function extractCborBytes(bytes: Uint8Array, offset: number): [Uint8Array, number] {
+  const header = bytes[offset];
+  if ((header & 0xe0) !== 0x40) throw new Error("not a CBOR bstr");
+  const info = header & 0x1f;
+  if (info < 24) {
+    const start = offset + 1;
+    return [bytes.slice(start, start + info), start + info];
+  }
+  const widths: Record<number, number> = { 24: 1, 25: 2, 26: 4, 27: 8 };
+  const w = widths[info];
+  if (!w) throw new Error(`unsupported bstr info ${info}`);
+  let len = 0;
+  for (let j = 1; j <= w; j++) len = (len << 8) | bytes[offset + j];
+  const start = offset + 1 + w;
+  return [bytes.slice(start, start + len), start + len];
+}
+
+function logActiveScriptHashes(): void {
+  if (!import.meta.env.DEV) return;
+  console.info("[vaultService] active script hashes", {
+    vaultAddress: VAULT_ADDRESS,
+    vaultHashFromConstant: VAULT_SCRIPT_HASH,
+    vaultHashFromScript: ACTIVE_VAULT_SCRIPT_HASH,
+    ssadaPolicyFromConstant: SSADA_POLICY_ID,
+    ssadaPolicyFromScript: ACTIVE_SSADA_POLICY_ID,
+  });
+}
+
+function assertLiveScriptAlignment(action: string, vaultUtxo: UTxO, vaultState: VaultState): void {
+  if (VAULT_SCRIPT_HASH !== ACTIVE_VAULT_SCRIPT_HASH) {
+    throw new Error(
+      `${action} blocked: configured vault hash ${VAULT_SCRIPT_HASH} does not match script hash ${ACTIVE_VAULT_SCRIPT_HASH}. ` +
+      "Restart Vite and hard-refresh the browser.",
+    );
+  }
+  if (SSADA_POLICY_ID !== ACTIVE_SSADA_POLICY_ID) {
+    throw new Error(
+      `${action} blocked: configured ssADA policy ${SSADA_POLICY_ID} does not match mint script policy ${ACTIVE_SSADA_POLICY_ID}. ` +
+      "Restart Vite and hard-refresh the browser.",
+    );
+  }
+  const liveVaultScriptHash = deserializeAddress(vaultUtxo.output.address).scriptHash;
+  if (liveVaultScriptHash && liveVaultScriptHash !== ACTIVE_VAULT_SCRIPT_HASH) {
+    throw new Error(
+      `${action} blocked: active vault script hash ${ACTIVE_VAULT_SCRIPT_HASH} does not match live vault UTxO script hash ${liveVaultScriptHash}. ` +
+      "Most likely the browser is running a stale bundle. Hard-refresh the app and restart Vite after clearing node_modules/.vite.",
+    );
+  }
+  if (vaultState.ssadaPolicyId !== ACTIVE_SSADA_POLICY_ID) {
+    throw new Error(
+      `${action} blocked: active ssADA policy ${ACTIVE_SSADA_POLICY_ID} does not match vault datum policy ${vaultState.ssadaPolicyId}. ` +
+      "Most likely the browser is running a stale bundle. Hard-refresh the app and restart Vite after clearing node_modules/.vite.",
+    );
+  }
+}
+
+function logPendingScriptWitnesses(action: string, txBuilder: MeshTxBuilder): void {
+  if (!import.meta.env.DEV) return;
+  const internal = txBuilder as MeshTxBuilder & {
+    meshTxBuilderBody?: { inputs?: unknown[]; mints?: unknown[] };
+    txInQueueItem?: unknown;
+    mintItem?: unknown;
+  };
+  console.info(`[${action}] pending script witnesses`, {
+    inputsQueued: internal.meshTxBuilderBody?.inputs?.length ?? 0,
+    mintsQueued: internal.meshTxBuilderBody?.mints?.length ?? 0,
+    currentInput: internal.txInQueueItem,
+    currentMint: internal.mintItem,
+  });
+}
+
+function stringifyDiagnostic(value: unknown): string {
+  return JSON.stringify(value, (_, v) => (typeof v === "bigint" ? v.toString() : v));
+}
+
+function errorMessage(err: unknown): string {
+  return (err as { info?: string })?.info ?? (err as { message?: string })?.message ?? JSON.stringify(err);
+}
+
+logActiveScriptHashes();
 
 export function parseVaultState(utxo: UTxO): VaultState | null {
   const raw = utxo.output.plutusData;
@@ -250,7 +346,10 @@ export async function fetchVaultUtxo(): Promise<UTxO | null> {
   if (!provider) return null;
   try {
     const utxos = await provider.fetchAddressUTxOs(VAULT_ADDRESS);
-    return utxos.find((u) => u.output.plutusData !== undefined) ?? null;
+    return utxos.find((u) => {
+      const state = parseVaultState(u);
+      return state?.ssadaPolicyId === ACTIVE_SSADA_POLICY_ID;
+    }) ?? null;
   } catch {
     return null;
   }
@@ -268,7 +367,7 @@ async function fetchOracleFeedUtxo(provider: BlockfrostProvider): Promise<UTxO> 
   if (!found) {
     throw new Error(
       `Charli3 OracleFeed UTxO not found at ${ORACLE_CONTRACT_ADDRESS}. ` +
-        `Oracle feed may be offline — Rebalance requires a fresh on-chain price.`,
+      `Oracle feed may be offline — Rebalance requires a fresh on-chain price.`,
     );
   }
   return found;
@@ -300,7 +399,7 @@ export async function initializeVault(wallet: MeshCardanoBrowserWallet): Promise
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
   // getChangeAddressBech32 returns bech32 directly (no normalizeAddress needed)
-  const userAddress = await wallet.getChangeAddressBech32();
+  const userAddress = await getChangeAddressBech32(wallet);
   if (!userAddress) throw new Error("Wallet not connected or no address found");
 
   const walletUtxos = await provider.fetchAddressUTxOs(userAddress);
@@ -323,7 +422,7 @@ export async function initializeVault(wallet: MeshCardanoBrowserWallet): Promise
     .complete();
 
   // signTxReturnFullTx returns the FULL signed tx CBOR (not just witness set)
-  const signedTx = await wallet.signTxReturnFullTx(unsignedTx, false);
+  const signedTx = await signTxReturnFullTx(wallet, unsignedTx, false);
 
   // Submit via Blockfrost for accurate error messages (wallet throws opaque CIP-30 objects)
   try {
@@ -349,7 +448,7 @@ export async function buildDepositTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const userAddress = await wallet.getChangeAddressBech32();
+  const userAddress = await getChangeAddressBech32(wallet);
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address — fund your preprod wallet first.");
@@ -361,13 +460,14 @@ export async function buildDepositTx(
 
   const vaultState = parseVaultState(vaultUtxo);
   if (!vaultState) throw new Error("Cannot decode vault datum — on-chain state unreadable.");
+  assertLiveScriptAlignment("Deposit", vaultUtxo, vaultState);
 
-  const prevTotalAda    = vaultState.totalAdaLovelace;
-  const prevTotalSsada  = vaultState.totalSsada;
-  const newTotalAda     = prevTotalAda + depositLovelace;
-  const ssadaToMint     = calcMintAmount(depositLovelace, prevTotalAda, prevTotalSsada);
-  const newTotalSsada   = prevTotalSsada + ssadaToMint;
-  const nowMs           = Date.now();
+  const prevTotalAda = vaultState.totalAdaLovelace;
+  const prevTotalSsada = vaultState.totalSsada;
+  const newTotalAda = prevTotalAda + depositLovelace;
+  const ssadaToMint = calcMintAmount(depositLovelace, prevTotalAda, prevTotalSsada);
+  const newTotalSsada = prevTotalSsada + ssadaToMint;
+  const nowMs = Date.now();
 
   const newDatum = buildVaultDatumData(
     newTotalAda,
@@ -377,17 +477,37 @@ export async function buildDepositTx(
     vaultState.yieldAccruedLovelace,
   );
 
-  const vaultRedeemer: Data = conStr0([]); // Deposit
-  const mintRedeemer: Data = conStr0([
+  const vaultRedeemer = conStr0([]); // Deposit
+  const mintRedeemer = conStr0([
     outputReference(vaultUtxo.input.txHash, vaultUtxo.input.outputIndex),
   ]);
+  const vaultAdaIn = BigInt(vaultUtxo.output.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0");
+  const vaultLovelaceOut = vaultAdaIn + depositLovelace;
+  const depositDiagnostic = {
+    vaultRef: `${vaultUtxo.input.txHash}#${vaultUtxo.input.outputIndex}`,
+    vaultAddress: vaultUtxo.output.address,
+    vaultDatumPolicy: vaultState.ssadaPolicyId,
+    activePolicy: ACTIVE_SSADA_POLICY_ID,
+    vaultDatumTotalAda: vaultState.totalAdaLovelace,
+    vaultActualLovelaceIn: vaultAdaIn,
+    depositLovelace,
+    vaultLovelaceOut,
+    ssadaToMint,
+    prevTotalSsada,
+    newTotalAda,
+    newTotalSsada,
+    vaultScriptHash: ACTIVE_VAULT_SCRIPT_HASH,
+  };
+  if (import.meta.env.DEV) {
+    console.info("[buildDepositTx] preflight", depositDiagnostic);
+  }
 
   const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
   txBuilder.setNetwork("preprod");
 
-  // applyCborEncoding double-wraps the CBOR so the Mesh SDK stores the original
-  // single-CBOR bytes in the witness set — the Cardano protocol hashes scripts
-  // as blake2b224(0x03 || cbor_bytes), so the CBOR wrapper must be preserved.
+  // Aiken's compiledCode already matches the script hash embedded in VAULT_ADDRESS.
+  // Do not wrap it again; extra wrapping changes the witness hash and causes
+  // `missingRequiredScripts spend:0`.
   txBuilder
     .spendingPlutusScriptV3()
     .txIn(
@@ -396,7 +516,7 @@ export async function buildDepositTx(
       vaultUtxo.output.amount,
       vaultUtxo.output.address,
     )
-    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInScript(ACTIVE_VAULT_SCRIPT_CBOR)
     .txInInlineDatumPresent()
     .txInRedeemerValue(vaultRedeemer, "JSON");
 
@@ -404,17 +524,11 @@ export async function buildDepositTx(
   txBuilder
     .mintPlutusScriptV3()
     .mint(ssadaToMint.toString(), SSADA_POLICY_ID, SSADA_TOKEN_NAME)
-    .mintingScript(applyCborEncoding(SSADA_MINT_SCRIPT_CBOR))
+    .mintingScript(ACTIVE_SSADA_MINT_SCRIPT_CBOR)
     .mintRedeemerValue(mintRedeemer, "JSON");
 
-  // Vault output with new datum + all ADA
-  const vaultAdaOut = (vaultUtxo
-    ? vaultUtxo.output.amount.find((a) => a.unit === "lovelace")?.quantity ?? "0"
-    : "0");
-  const vaultLovelaceOut = (BigInt(vaultAdaOut) + depositLovelace).toString();
-
   txBuilder
-    .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: vaultLovelaceOut }])
+    .txOut(VAULT_ADDRESS, [{ unit: "lovelace", quantity: vaultLovelaceOut.toString() }])
     .txOutInlineDatumValue(newDatum, "JSON");
 
   // ssADA to user
@@ -436,15 +550,27 @@ export async function buildDepositTx(
     txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
   }
 
-  const unsignedTx = await txBuilder.complete();
-  const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
+  logPendingScriptWitnesses("buildDepositTx", txBuilder);
+  let unsignedTx: string;
+  try {
+    unsignedTx = await txBuilder.complete();
+  } catch (err) {
+    console.error("[buildDepositTx] complete failed", {
+      diagnostic: depositDiagnostic,
+      error: err,
+    });
+    throw new Error(
+      `Deposit evaluation failed. Diagnostic: ${stringifyDiagnostic(depositDiagnostic)}. Raw error: ${errorMessage(err)}`,
+    );
+  }
+  const signedTx = await signTxReturnFullTx(wallet, unsignedTx, true);
 
   try {
     const txHash = await provider.submitTx(signedTx);
     return { txHash, ssadaMinted: ssadaToMint };
   } catch (err) {
     console.error("[buildDepositTx] submitTx raw error:", err);
-    const msg = (err as { info?: string })?.info ?? (err as { message?: string })?.message ?? JSON.stringify(err);
+    const msg = errorMessage(err);
     throw new Error(`Submit failed: ${msg}`);
   }
 }
@@ -458,7 +584,7 @@ export async function buildWithdrawTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const userAddress = await wallet.getChangeAddressBech32();
+  const userAddress = await getChangeAddressBech32(wallet);
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
@@ -468,6 +594,7 @@ export async function buildWithdrawTx(
   if (!vaultUtxo) throw new Error("No vault UTxO found");
   const vaultState = parseVaultState(vaultUtxo);
   if (!vaultState) throw new Error("Cannot parse vault datum");
+  assertLiveScriptAlignment("Withdraw", vaultUtxo, vaultState);
 
   // Vault output must retain ≥MIN_VAULT_LOVELACE (Cardano minUtxo for script addr +
   // inline datum ≈1.2 ADA; 2 ADA gives headroom). If the requested burn would drain
@@ -487,7 +614,7 @@ export async function buildWithdrawTx(
     adaToReturn = calcRedeemAmount(ssadaBurnAmount, vaultState.totalAdaLovelace, vaultState.totalSsada);
   }
 
-  const newTotalAda  = vaultState.totalAdaLovelace - adaToReturn;
+  const newTotalAda = vaultState.totalAdaLovelace - adaToReturn;
   const newTotalSsada = vaultState.totalSsada - ssadaBurnAmount;
   const newDatum = buildVaultDatumData(
     newTotalAda,
@@ -497,8 +624,8 @@ export async function buildWithdrawTx(
     vaultState.yieldAccruedLovelace,
   );
 
-  const vaultRedeemer: Data = conStr1([]); // Withdraw
-  const burnRedeemer: Data = conStr1([
+  const vaultRedeemer = conStr1([]); // Withdraw
+  const burnRedeemer = conStr1([
     outputReference(vaultUtxo.input.txHash, vaultUtxo.input.outputIndex),
   ]);
 
@@ -513,7 +640,7 @@ export async function buildWithdrawTx(
       vaultUtxo.output.amount,
       vaultUtxo.output.address,
     )
-    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInScript(ACTIVE_VAULT_SCRIPT_CBOR)
     .txInInlineDatumPresent()
     .txInRedeemerValue(vaultRedeemer, "JSON");
 
@@ -521,7 +648,7 @@ export async function buildWithdrawTx(
   txBuilder
     .mintPlutusScriptV3()
     .mint((-ssadaBurnAmount).toString(), SSADA_POLICY_ID, SSADA_TOKEN_NAME)
-    .mintingScript(applyCborEncoding(SSADA_MINT_SCRIPT_CBOR))
+    .mintingScript(ACTIVE_SSADA_MINT_SCRIPT_CBOR)
     .mintRedeemerValue(burnRedeemer, "JSON");
 
   // Vault output (reduced ADA)
@@ -548,8 +675,9 @@ export async function buildWithdrawTx(
     txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
   }
 
+  logPendingScriptWitnesses("buildWithdrawTx", txBuilder);
   const unsignedTx = await txBuilder.complete();
-  const signedTx   = await wallet.signTxReturnFullTx(unsignedTx, true);
+  const signedTx = await signTxReturnFullTx(wallet, unsignedTx, true);
 
   try {
     const txHash = await provider.submitTx(signedTx);
@@ -578,7 +706,7 @@ export async function buildRebalanceTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const userAddress = await wallet.getChangeAddressBech32();
+  const userAddress = await getChangeAddressBech32(wallet);
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
@@ -588,6 +716,7 @@ export async function buildRebalanceTx(
   if (!vaultUtxo) throw new Error("No vault UTxO found");
   const vaultState = parseVaultState(vaultUtxo);
   if (!vaultState) throw new Error("Cannot parse vault datum");
+  assertLiveScriptAlignment("Rebalance", vaultUtxo, vaultState);
 
   if (vaultState.strategy === newStrategy) {
     throw new Error(`Vault is already on ${newStrategy} — no rebalance needed`);
@@ -614,7 +743,7 @@ export async function buildRebalanceTx(
     vaultState.yieldAccruedLovelace,
   );
 
-  const vaultRedeemer: Data = conStr2([]); // Rebalance
+  const vaultRedeemer = conStr2([]); // Rebalance
 
   const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
   txBuilder.setNetwork("preprod");
@@ -627,7 +756,7 @@ export async function buildRebalanceTx(
       vaultUtxo.output.amount,
       vaultUtxo.output.address,
     )
-    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInScript(ACTIVE_VAULT_SCRIPT_CBOR)
     .txInInlineDatumPresent()
     .txInRedeemerValue(vaultRedeemer, "JSON");
 
@@ -661,8 +790,9 @@ export async function buildRebalanceTx(
     txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
   }
 
+  logPendingScriptWitnesses("buildRebalanceTx", txBuilder);
   const unsignedTx = await txBuilder.complete();
-  const signedTx = await wallet.signTxReturnFullTx(unsignedTx, true);
+  const signedTx = await signTxReturnFullTx(wallet, unsignedTx, true);
 
   try {
     const txHash = await provider.submitTx(signedTx);
@@ -697,7 +827,7 @@ export async function buildInjectYieldTx(
   const provider = makeProvider();
   if (!provider) throw new Error("VITE_BLOCKFROST_PROJECT_ID not set — cannot build on-chain tx");
 
-  const userAddress = await wallet.getChangeAddressBech32();
+  const userAddress = await getChangeAddressBech32(wallet);
   if (!userAddress) throw new Error("Wallet not connected or no address found");
   const userUtxos = await provider.fetchAddressUTxOs(userAddress);
   if (!userUtxos.length) throw new Error("No UTxOs at wallet address.");
@@ -707,6 +837,7 @@ export async function buildInjectYieldTx(
   if (!vaultUtxo) throw new Error("No vault UTxO found");
   const vaultState = parseVaultState(vaultUtxo);
   if (!vaultState) throw new Error("Cannot parse vault datum");
+  assertLiveScriptAlignment("InjectYield", vaultUtxo, vaultState);
 
   const yieldLovelace = BigInt(Math.floor(yieldAda * 1_000_000));
   if (yieldLovelace <= 0n) throw new Error("Yield amount must be positive");
@@ -723,7 +854,7 @@ export async function buildInjectYieldTx(
   );
 
   // InjectYield { amount_lovelace: Int } = Constr(3, [Int])
-  const vaultRedeemer: Data = conStr3([integer(Number(yieldLovelace))]);
+  const vaultRedeemer = conStr3([integer(Number(yieldLovelace))]);
 
   const txBuilder = new MeshTxBuilder({ fetcher: provider, submitter: provider, evaluator: provider });
   txBuilder.setNetwork("preprod");
@@ -736,7 +867,7 @@ export async function buildInjectYieldTx(
       vaultUtxo.output.amount,
       vaultUtxo.output.address,
     )
-    .txInScript(applyCborEncoding(VAULT_SCRIPT_CBOR))
+    .txInScript(ACTIVE_VAULT_SCRIPT_CBOR)
     .txInInlineDatumPresent()
     .txInRedeemerValue(vaultRedeemer, "JSON");
 
@@ -763,8 +894,9 @@ export async function buildInjectYieldTx(
     txBuilder.setTotalCollateral(COLLATERAL_AMOUNT_LOVELACE);
   }
 
+  logPendingScriptWitnesses("buildInjectYieldTx", txBuilder);
   const unsignedTx = await txBuilder.complete();
-  const signedTx = await wallet.signTxReturnFullTx(unsignedTx, true);
+  const signedTx = await signTxReturnFullTx(wallet, unsignedTx, true);
 
   try {
     const txHash = await provider.submitTx(signedTx);

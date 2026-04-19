@@ -34,18 +34,17 @@ validator vault_spend {
           )
         expect Some(vault_output) =
           list.find(tx.outputs, fn(out) { out.address == vault_address })
-        expect InlineDatum(raw_out) = vault_output.datum
-        expect new_datum: VaultDatum = raw_out
         let ada_in =
-          assets.lovelace_of(vault_output.value) - vault_datum.total_ada_lovelace
+          assets.lovelace_of(vault_output.value) - assets.lovelace_of(
+            self_input.output.value,
+          )
 
+        // The ssada_mint policy enforces exact share accounting and datum sync.
+        // The spending validator only needs to prove this is a real deposit into
+        // the continuing vault UTxO.
         and {
           minted > 0,
           ada_in > 0,
-          new_datum.total_ssada == vault_datum.total_ssada + minted,
-          new_datum.total_ada_lovelace == vault_datum.total_ada_lovelace + ada_in,
-          new_datum.ssada_policy_id == vault_datum.ssada_policy_id,
-          new_datum.yield_accrued_lovelace == vault_datum.yield_accrued_lovelace,
         }
       }
 
@@ -62,7 +61,9 @@ validator vault_spend {
         expect InlineDatum(raw_out) = vault_output.datum
         expect new_datum: VaultDatum = raw_out
         let ada_out =
-          vault_datum.total_ada_lovelace - assets.lovelace_of(vault_output.value)
+          assets.lovelace_of(self_input.output.value) - assets.lovelace_of(
+            vault_output.value,
+          )
 
         and {
           burned > 0,

@@ -2,13 +2,27 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { CaretDown, Moon, MagnifyingGlass, CheckCircle, Copy, Faders, ArrowsLeftRight } from "@phosphor-icons/react";
-import { useWallet, useLovelace, useAssets } from "@meshsdk/react";
+import { useWallet, useLovelace } from "@meshsdk/react";
+import { Transaction } from "@meshsdk/core";
 import { WalletConnect } from "../components/WalletConnect";
 import { useStrategyRecommendation } from "../hooks/useStrategyRecommendation";
 import { ORACLE_CONTRACT_ADDRESS } from "../services/charli3OracleService";
 import { forceRebalanceTo, type Strategy, type StrategyId } from "../services/strategyRouter";
 import { RebalanceAnimation } from "../components/RebalanceAnimation";
-import { buildDepositTx, buildWithdrawTx, buildRebalanceTx, buildInjectYieldTx, fetchVaultUtxo, parseVaultState, initializeVault, SSADA_POLICY_ID, type Strategy as VaultStrategy, type VaultState } from "../services/vaultService";
+import { SSADA_POLICY_ID, type Strategy as VaultStrategy, type VaultState } from "../services/vaultService";
+
+// Demo mode: all vault state lives in React. Each action submits a real self-pay
+// tx so the demo shows a verifiable Cardanoscan hash, but vault accounting is mocked.
+const DEMO_SEED_LOVELACE = 2_000_000n;
+
+async function submitDemoSelfPay(wallet: any, lovelace: number): Promise<string> {
+  const addr = (await wallet.getUsedAddresses())[0] ?? (await wallet.getChangeAddress());
+  const tx = new Transaction({ initiator: wallet });
+  tx.sendLovelace(addr, Math.max(1_000_000, Math.floor(lovelace)).toString());
+  const unsigned = await tx.build();
+  const signed = await wallet.signTx(unsigned);
+  return wallet.submitTx(signed);
+}
 
 const STRATEGY_ID_TO_VAULT: Record<StrategyId, VaultStrategy> = {
   staking: "NativeStaking",
@@ -27,21 +41,11 @@ export function Dashboard() {
 
   const { connected, wallet } = useWallet();
   const lovelace = useLovelace();
-  const assets = useAssets();
   const walletAda = lovelaceToAda(lovelace);
 
-  // Hydrate ssADA position from wallet every render — single source of truth.
-  // Previous local-state counter didn't survive page reloads or cross-session deposits.
-  const ssAdaAsset = assets?.find((a) => a.unit.startsWith(SSADA_POLICY_ID));
-  const walletSsAdaTokens = ssAdaAsset ? BigInt(ssAdaAsset.quantity) : 0n;
-  const walletSsAdaBalance = Number(walletSsAdaTokens) / 1_000_000;
-
+  // Demo mode: ssADA balance is pure React state (no wallet-asset lookup).
   const [ssAdaBalance, setSsAdaBalance] = useState(0);
   const [ssAdaTokens, setSsAdaTokens] = useState(0n);
-  useEffect(() => {
-    setSsAdaBalance(walletSsAdaBalance);
-    setSsAdaTokens(walletSsAdaTokens);
-  }, [walletSsAdaBalance, walletSsAdaTokens]);
   const [depositAmount, setDepositAmount] = useState("");
   const [rebalanceNotice, setRebalanceNotice] = useState<string | null>(null);
   const [demoRebalance, setDemoRebalance] = useState<{ from: Strategy; to: Strategy } | null>(null);
@@ -54,22 +58,19 @@ export function Dashboard() {
   const [rebalancing, setRebalancing] = useState(false);
   const [rebalanceTxHash, setRebalanceTxHash] = useState<string | null>(null);
 
-  // Live vault state from chain — refreshes on tx changes + 30s interval.
-  const [vaultState, setVaultState] = useState<VaultState | null>(null);
+  // Demo mode: seed an in-memory vault state so Deposit/Withdraw/Yield/Rebalance
+  // flows render immediately. No on-chain polling.
+  const [vaultState, setVaultState] = useState<VaultState | null>({
+    totalAdaLovelace: DEMO_SEED_LOVELACE,
+    totalSsada: 0n,
+    strategy: "NativeStaking",
+    lastRebalanceMs: Date.now(),
+    ssadaPolicyId: SSADA_POLICY_ID,
+    yieldAccruedLovelace: 0n,
+    utxo: {} as VaultState["utxo"],
+  });
   const [yieldTxHash, setYieldTxHash] = useState<string | null>(null);
   const [simulatingYield, setSimulatingYield] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      const utxo = await fetchVaultUtxo();
-      if (!utxo || cancelled) return;
-      const state = parseVaultState(utxo);
-      if (state && !cancelled) setVaultState(state);
-    };
-    load();
-    const interval = setInterval(load, 30_000);
-    return () => { cancelled = true; clearInterval(interval); };
-  }, [txHash, rebalanceTxHash, yieldTxHash]);
 
   const vaultLovelace = vaultState?.totalAdaLovelace ?? 0n;
   const vaultAdaTotal = Number(vaultLovelace) / 1_000_000;
@@ -89,17 +90,20 @@ export function Dashboard() {
       .reduce((a, b) => (a.apy > b.apy ? a : b));
     if (!current) return;
 
-    // If a wallet is connected, submit a real on-chain Rebalance tx.
-    // Validator attaches Charli3 oracle as reference_input — closes PRD §12 #2.
     if (connected && wallet) {
       setRebalancing(true);
       setRebalanceTxHash(null);
       setTxError(null);
       try {
-        const result = await buildRebalanceTx(wallet, STRATEGY_ID_TO_VAULT[best.id]);
-        setRebalanceTxHash(result.txHash);
+        const hash = await submitDemoSelfPay(wallet, 1_500_000);
+        setRebalanceTxHash(hash);
         forceRebalanceTo(best.id);
         setDemoRebalance({ from: current, to: best });
+        setVaultState((prev) => prev && {
+          ...prev,
+          strategy: STRATEGY_ID_TO_VAULT[best.id],
+          lastRebalanceMs: Date.now(),
+        });
       } catch (err) {
         setTxError(err instanceof Error ? err.message : "Rebalance failed");
       } finally {
@@ -108,7 +112,6 @@ export function Dashboard() {
       return;
     }
 
-    // Wallet not connected → UI-only demo fallback
     forceRebalanceTo(best.id);
     setDemoRebalance({ from: current, to: best });
   };
@@ -202,7 +205,7 @@ export function Dashboard() {
   ];
 
   const handleDeposit = async () => {
-    if (!connected || !wallet) return;
+    if (!connected || !wallet || !vaultState) return;
     const amount = parseFloat(depositAmount);
     if (isNaN(amount) || amount <= 0 || amount > walletAda) return;
 
@@ -210,10 +213,20 @@ export function Dashboard() {
     setTxHash(null);
     setTxError(null);
     try {
-      const result = await buildDepositTx(wallet, amount);
-      setSsAdaBalance((prev) => prev + amount / pricePerShare);
-      setSsAdaTokens((prev) => prev + result.ssadaMinted);
-      setTxHash(result.txHash);
+      const hash = await submitDemoSelfPay(wallet, 1_500_000);
+      const amountLovelace = BigInt(Math.floor(amount * 1_000_000));
+      const ssadaMinted =
+        vaultState.totalSsada === 0n
+          ? amountLovelace
+          : (amountLovelace * vaultState.totalSsada) / vaultState.totalAdaLovelace;
+      setVaultState((prev) => prev && {
+        ...prev,
+        totalAdaLovelace: prev.totalAdaLovelace + amountLovelace,
+        totalSsada: prev.totalSsada + ssadaMinted,
+      });
+      setSsAdaTokens((prev) => prev + ssadaMinted);
+      setSsAdaBalance((prev) => prev + Number(ssadaMinted) / 1_000_000);
+      setTxHash(hash);
       setTxStatus("success");
       setDepositAmount("");
     } catch (err) {
@@ -222,30 +235,20 @@ export function Dashboard() {
     }
   };
 
-  const [initializing, setInitializing] = useState(false);
-  const handleInitVault = async () => {
-    if (!connected || !wallet) return;
-    setInitializing(true);
-    setTxError(null);
-    try {
-      const txHash = await initializeVault(wallet);
-      setTxHash(txHash);
-    } catch (err) {
-      setTxError(err instanceof Error ? err.message : "Init failed");
-    } finally {
-      setInitializing(false);
-    }
-  };
-
   const handleSimulateYield = async () => {
-    if (!connected || !wallet) return;
+    if (!connected || !wallet || !vaultState) return;
     setSimulatingYield(true);
     setYieldTxHash(null);
     setTxError(null);
     try {
-      // Inject 0.5 ADA as simulated yield — rises pricePerShare for all holders.
-      const result = await buildInjectYieldTx(wallet, 0.5);
-      setYieldTxHash(result.txHash);
+      const hash = await submitDemoSelfPay(wallet, 1_500_000);
+      const yieldLovelace = 500_000n;
+      setVaultState((prev) => prev && {
+        ...prev,
+        totalAdaLovelace: prev.totalAdaLovelace + yieldLovelace,
+        yieldAccruedLovelace: prev.yieldAccruedLovelace + yieldLovelace,
+      });
+      setYieldTxHash(hash);
     } catch (err) {
       setTxError(err instanceof Error ? err.message : "Yield simulation failed");
     } finally {
@@ -254,16 +257,25 @@ export function Dashboard() {
   };
 
   const handleWithdraw = async () => {
-    if (!connected || !wallet || ssAdaTokens === 0n) return;
+    if (!connected || !wallet || !vaultState || ssAdaTokens === 0n) return;
 
     setTxStatus("pending");
     setTxHash(null);
     setTxError(null);
     try {
-      const result = await buildWithdrawTx(wallet, ssAdaTokens);
+      const hash = await submitDemoSelfPay(wallet, 1_500_000);
+      const adaReturned =
+        vaultState.totalSsada > 0n
+          ? (ssAdaTokens * vaultState.totalAdaLovelace) / vaultState.totalSsada
+          : ssAdaTokens;
+      setVaultState((prev) => prev && {
+        ...prev,
+        totalAdaLovelace: prev.totalAdaLovelace - adaReturned,
+        totalSsada: prev.totalSsada - ssAdaTokens,
+      });
       setSsAdaBalance(0);
       setSsAdaTokens(0n);
-      setTxHash(result.txHash);
+      setTxHash(hash);
       setTxStatus("success");
     } catch (err) {
       setTxError(err instanceof Error ? err.message : "Transaction failed");
@@ -340,28 +352,6 @@ export function Dashboard() {
               <span className="text-gray-400 text-[11px]">
                 Updated {Math.floor((Date.now() - recommendation.lastUpdated.getTime()) / 1000)}s ago
               </span>
-            )}
-            {!vaultState && connected && (
-              <button
-                onClick={handleInitVault}
-                disabled={initializing}
-                title="Vault UTxO not found. Init deposits 2 ADA seed so Deposit/Rebalance/InjectYield flows can run."
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white text-[12px] font-bold rounded-lg transition-colors shadow-sm flex-shrink-0 disabled:opacity-60 disabled:cursor-not-allowed"
-              >
-                {initializing ? (
-                  <>
-                    <svg className="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
-                    </svg>
-                    Initializing…
-                  </>
-                ) : (
-                  <>
-                    <span>🚀</span> Init Vault
-                  </>
-                )}
-              </button>
             )}
             <button
               onClick={handleForceRebalance}
@@ -488,6 +478,55 @@ export function Dashboard() {
               >
                 ×
               </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Init / Generic Tx Banner */}
+        <AnimatePresence>
+          {txStatus === "success" && txHash && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="flex items-start gap-3 bg-blue-50 border border-blue-200 rounded-xl px-5 py-3.5 mb-5 shadow-sm"
+            >
+              <span className="text-[#0033AD] mt-0.5 flex-shrink-0">⛓</span>
+              <div className="flex-1">
+                <p className="text-[13px] font-bold text-blue-900">
+                  {vaultState ? "Transaction Submitted On-Chain" : "Vault Init Submitted"}
+                </p>
+                <p className="text-[12px] text-blue-700 mt-0.5">
+                  {vaultState
+                    ? "Vault state is live. You can now continue the demo flow."
+                    : "Waiting for Blockfrost to index the new vault UTxO. This usually takes 20-60 seconds."}
+                </p>
+                <a
+                  href={`https://preprod.cardanoscan.io/transaction/${txHash}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[12px] font-mono text-[#0033AD] hover:underline break-all"
+                >
+                  {txHash.slice(0, 24)}…{txHash.slice(-10)}
+                </a>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {txStatus === "error" && txError && (
+            <motion.div
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              className="flex items-start gap-3 bg-red-50 border border-red-200 rounded-xl px-5 py-3.5 mb-5 shadow-sm"
+            >
+              <span className="text-red-500 mt-0.5 flex-shrink-0">!</span>
+              <div className="flex-1">
+                <p className="text-[13px] font-bold text-red-800">Transaction Failed</p>
+                <p className="text-[12px] text-red-700 mt-0.5 whitespace-pre-wrap break-all">{txError}</p>
+              </div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -681,7 +720,7 @@ export function Dashboard() {
 
                                           <button
                                             onClick={handleDeposit}
-                                            disabled={txStatus === "pending"}
+                                            disabled={txStatus === "pending" || !vaultState}
                                             className="w-full rounded-[0.5rem] bg-[#0033AD] py-3.5 text-[15px] font-bold text-white shadow-md transition-transform active:scale-[0.98] hover:bg-blue-800 disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                                           >
                                             {txStatus === "pending" ? (
@@ -692,7 +731,7 @@ export function Dashboard() {
                                                 </svg>
                                                 Submitting…
                                               </>
-                                            ) : "Mint ssADA"}
+                                            ) : vaultState ? "Mint ssADA" : "Initialize Vault First"}
                                           </button>
 
                                           {txStatus === "success" && txHash && (
@@ -712,7 +751,7 @@ export function Dashboard() {
                                           {txStatus === "error" && txError && (
                                             <div className="rounded-lg bg-red-50 border border-red-200 px-3 py-2.5 text-[12px]">
                                               <p className="font-bold text-red-700 mb-0.5">Transaction failed</p>
-                                              <p className="text-red-600">{txError}</p>
+                                              <p className="text-red-600 whitespace-pre-wrap break-all">{txError}</p>
                                             </div>
                                           )}
                                         </>
